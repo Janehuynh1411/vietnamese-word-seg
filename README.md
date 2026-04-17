@@ -1,0 +1,1 @@
+# vietnamese-word-seg
