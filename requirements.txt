@@ -1,0 +1,42 @@
+# vnlp
+nltk
+spacy
+pyvi>=3.2.0
+vncorenlp>=1.0.3
+underthesea>=6.0.0
+
+# hmm
+hmmlearn>=0.3.0
+numpy>=2.0.0
+scikit-learn>=1.0.0
+scipy>=1.6.0
+pandas>=2.0.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# llm
+litellm>=1.50.0
+langchain>=0.3.5
+transformers>=4.40.0
+torch>=2.0.0
+peft>=0.10.0
+datasets>=2.10.0
+sentencepiece>=0.1.99
+sentence-transformers>=2.2.2
+
+# TACC finetune
+accelerate>=0.21.0
+bitsandbytes>=0.40.0
+
+# MAC finetune
+# mlx>=0.20.0
+# mlx-lm>=0.18.0
+
+# other web stuffs
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+tqdm>=4.65.0
+requests>=2.28.0
+urllib3>=1.26.0
+beautifulsoup4>=4.11.0
+html2text>=2020.1.16
