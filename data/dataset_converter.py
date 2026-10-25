@@ -178,6 +178,15 @@ def parse_label_studio_task(task: dict, use_silver_fallback: bool = True) -> Opt
 
     if spans:
         spans.sort(key=lambda x: (x[0], x[1]))
+        # Deduplicate exact or overlapping spans
+        dedup_spans = []
+        last_end = -1
+        for start, end, span_text, lbl in spans:
+            if start < last_end:
+                continue
+            dedup_spans.append((start, end, span_text, lbl))
+            last_end = end
+        spans = dedup_spans
         # Check whether labels are B/I syllable tags or word/POS span labels
         label_set = {s[3] for s in spans}
         if label_set.issubset({"B", "I", "B-W", "I-W", "B_W", "I_W"}):
@@ -207,7 +216,8 @@ def parse_label_studio_task(task: dict, use_silver_fallback: bool = True) -> Opt
                 clean_span = "_".join(span_text.strip().split())
                 if clean_span:
                     words.append(clean_span)
-                    pos_tags.append(lbl)
+                    short_lbl = lbl.split()[0] if lbl else "N"
+                    pos_tags.append(short_lbl)
                 cursor = max(cursor, end)
             if cursor < len(text):
                 tail = text[cursor:].strip()
