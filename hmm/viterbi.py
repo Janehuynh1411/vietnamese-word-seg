@@ -1,5 +1,4 @@
 import json
-import yaml
 import os
 
 class ViterbiSegmenter:

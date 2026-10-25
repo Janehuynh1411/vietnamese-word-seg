@@ -1,11 +1,18 @@
 import os
 import json
-import yaml
 from collections import Counter, defaultdict
 
-def load_config():
-    with open("config.yaml", "r") as f:
-        return yaml.safe_load(f)
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def load_config(config_path="config.yaml"):
+    if yaml is not None:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    return {"paths": {"processed_data": "data/processed"}}
 
 def get_tags(sentence):
     """

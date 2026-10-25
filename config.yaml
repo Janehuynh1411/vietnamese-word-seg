@@ -6,35 +6,48 @@ project:
 # HMM config
 hmm:
   model_type: "CategoricalHMM"
-  n_components: 5               
+  n_components: 5
   implementation: "viterbi" # viterbi decoding
   smoothing_factor: 0.1 # Laplace smoothing
-  data_split: 0.8              
+  data_split: 0.8
+  ws_weights: "models/hmm_weights.json"
+  pos_weights: "models/pos_hmm.json"
 
+# PhoBERT token classification config
+phobert:
+  model_name: "vinai/phobert-base"
+  max_length: 256
+  batch_size: 16
+  learning_rate: 2.0e-5
+  epochs: 5
+  weight_decay: 0.01
+  seed: 42
+  ws_checkpoint: "models/phobert_ws"
+  pos_checkpoint: "models/phobert_pos"
 
 # LLM config
 llm:
   primary_model: "groq/llama-3.1-70b-versatile"
-  fallback_model: "gemini/gemini-1.5-flash" 
-  
+  fallback_model: "gemini/gemini-1.5-flash"
+
   params:
     temperature: 0.0
     max_tokens: 512
     top_p: 1.0
     seed: 42
-  
+
   prompting:
     strategy: "few-shot" # zero-shot, few-shot, chain-of-thought
-    context_window: 2           
-
+    context_window: 2
 
 # data & file management
 paths:
-  raw_data: "data/raw/vietnamese_corpus.txt"
-  processed_data: "data/processed/tokens.json"
-  checkpoints: "hmm/checkpoints/model_v1.pkl"
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  ws_splits: "data/processed/ws_splits.json"
+  pos_splits: "data/processed/pos_splits.json"
+  checkpoints: "models/hmm_weights.json"
   logs: "logs/experiment_results.csv"
-
 
 # eval metrics
 evaluation:
