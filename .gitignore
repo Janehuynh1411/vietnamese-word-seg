@@ -1,0 +1,20 @@
+# python junk
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# data junk
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+outputs/
+logs/
+
+# sensitive info
+.env
+config.yaml  # If it contains API keys (keep a config.example.yaml instead)
+
+# os junk
+.DS_Store
