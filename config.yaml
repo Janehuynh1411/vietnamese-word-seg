@@ -1,0 +1,42 @@
+project:
+  name: "Vietnamese-WS-Hybrid-Thesis"
+  version: "1.0.0"
+  author: "Jane Huynh"
+
+# HMM config
+hmm:
+  model_type: "CategoricalHMM"
+  n_components: 5               
+  implementation: "viterbi" # viterbi decoding
+  smoothing_factor: 0.1 # Laplace smoothing
+  data_split: 0.8              
+
+
+# LLM config
+llm:
+  primary_model: "groq/llama-3.1-70b-versatile"
+  fallback_model: "gemini/gemini-1.5-flash" 
+  
+  params:
+    temperature: 0.0
+    max_tokens: 512
+    top_p: 1.0
+    seed: 42
+  
+  prompting:
+    strategy: "few-shot" # zero-shot, few-shot, chain-of-thought
+    context_window: 2           
+
+
+# data & file management
+paths:
+  raw_data: "data/raw/vietnamese_corpus.txt"
+  processed_data: "data/processed/tokens.json"
+  checkpoints: "hmm/checkpoints/model_v1.pkl"
+  logs: "logs/experiment_results.csv"
+
+
+# eval metrics
+evaluation:
+  metrics: ["f1_score", "precision", "recall", "oov_recall"]
+  baseline_comparison: "pyvi"
