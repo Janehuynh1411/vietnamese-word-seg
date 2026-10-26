@@ -1,0 +1,73 @@
+project:
+  name: "Vietnamese-WS-Hybrid-Thesis"
+  version: "1.0.0"
+  author: "Jane Huynh"
+
+# HMM config
+hmm:
+  model_type: "CategoricalHMM"
+  n_components: 5
+  implementation: "viterbi" # viterbi decoding
+  smoothing_factor: 0.1 # Laplace smoothing
+  data_split: 0.8
+  ws_weights: "models/hmm_weights.json"
+  pos_weights: "models/pos_hmm.json"
+
+# PhoBERT token classification config
+phobert:
+  model_name: "vinai/phobert-base"
+  max_length: 256
+  batch_size: 16
+  learning_rate: 2.0e-5
+  epochs: 5
+  weight_decay: 0.01
+  seed: 42
+  ws_checkpoint: "models/phobert_ws"
+  pos_checkpoint: "models/phobert_pos"
+
+# LLM config (Qwen vs. Llama Benchmarking & Asymmetric Routing)
+llm:
+  primary_model: "groq/llama-3.1-70b-versatile"
+  fallback_model: "groq/qwen-2.5-32b"
+
+  # Head-to-head benchmark models (supports Cloud LiteLLM, Ollama, or Local HuggingFace)
+  models:
+    qwen:
+      api_model: "groq/qwen-2.5-32b"
+      ollama_model: "ollama/qwen2.5:7b"
+      hf_model: "Qwen/Qwen2.5-1.5B-Instruct"
+      tokenizer_id: "Qwen/Qwen2.5-1.5B-Instruct"
+    llama:
+      api_model: "groq/llama-3.1-70b-versatile"
+      ollama_model: "ollama/llama3.1:8b"
+      hf_model: "meta-llama/Llama-3.2-1B-Instruct"
+      tokenizer_id: "huggyllama/llama-7b"
+
+  params:
+    temperature: 0.0
+    max_tokens: 512
+    top_p: 1.0
+    seed: 42
+
+  prompting:
+    strategy: "few-shot" # zero-shot, few-shot, chain-of-thought
+    context_window: 2
+
+# Asymmetric confidence routing thresholds
+routing:
+  hmm_confidence_threshold: 0.85
+  phobert_confidence_threshold: 0.70
+
+# data & file management
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  ws_splits: "data/processed/ws_splits.json"
+  pos_splits: "data/processed/pos_splits.json"
+  checkpoints: "models/hmm_weights.json"
+  logs: "logs/experiment_results.csv"
+
+# eval metrics
+evaluation:
+  metrics: ["f1_score", "precision", "recall", "oov_recall"]
+  baseline_comparison: "pyvi"
