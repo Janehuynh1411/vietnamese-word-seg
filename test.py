@@ -138,11 +138,12 @@ class TestVietnameseWordSegPipeline(unittest.TestCase):
         self.assertEqual(parsed_pos, [("Tôi", "P"), ("là", "V"), ("sinh_viên", "N"), (".", "CH")])
 
     def test_llm_client_offline_fallback(self):
-        client = LLMWordSegmenterClient()
-        seg = client.segment("Tôi là sinh viên .")
-        self.assertEqual(len(seg.replace("_", " ").split()), 5)
-        tagged = client.tag_segmented(seg)
-        self.assertEqual(len(tagged), len(seg.split()))
+        for family in ("qwen", "llama"):
+            client = LLMWordSegmenterClient(model_family=family, backend="offline")
+            seg = client.segment("Tôi là sinh viên .")
+            self.assertEqual(len(seg.replace("_", " ").split()), 5)
+            tagged = client.tag_segmented(seg)
+            self.assertEqual(len(tagged), len(seg.split()))
 
     def test_hmm_viterbi_confidence(self):
         if os.path.exists("models/hmm_weights.json"):

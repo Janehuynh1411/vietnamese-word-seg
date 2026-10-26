@@ -452,14 +452,13 @@ def save_processed_splits(
     with open(pos_test_txt, "w", encoding="utf-8") as f:
         f.write("\n".join(r["pos_text"] for r in splits["test"]) + "\n")
 
-    # Populate data/dictionary.txt from unique segmented words across splits
+    # Populate data/dictionary.txt from unique segmented words in the TRAIN split only (prevents test leakage)
     dict_path = "data/dictionary.txt"
     os.makedirs(os.path.dirname(dict_path) or ".", exist_ok=True)
     vocab_words = sorted(
         {
             w.lower()
-            for split_list in splits.values()
-            for r in split_list
+            for r in splits["train"]
             for w in r["words"]
             if any(c.isalnum() for c in w)
         }

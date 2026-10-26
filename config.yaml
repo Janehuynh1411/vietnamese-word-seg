@@ -25,10 +25,23 @@ phobert:
   ws_checkpoint: "models/phobert_ws"
   pos_checkpoint: "models/phobert_pos"
 
-# LLM config
+# LLM config (Qwen vs. Llama Benchmarking & Asymmetric Routing)
 llm:
   primary_model: "groq/llama-3.1-70b-versatile"
-  fallback_model: "gemini/gemini-1.5-flash"
+  fallback_model: "groq/qwen-2.5-32b"
+
+  # Head-to-head benchmark models (supports Cloud LiteLLM, Ollama, or Local HuggingFace)
+  models:
+    qwen:
+      api_model: "groq/qwen-2.5-32b"
+      ollama_model: "ollama/qwen2.5:7b"
+      hf_model: "Qwen/Qwen2.5-1.5B-Instruct"
+      tokenizer_id: "Qwen/Qwen2.5-1.5B-Instruct"
+    llama:
+      api_model: "groq/llama-3.1-70b-versatile"
+      ollama_model: "ollama/llama3.1:8b"
+      hf_model: "meta-llama/Llama-3.2-1B-Instruct"
+      tokenizer_id: "huggyllama/llama-7b"
 
   params:
     temperature: 0.0
@@ -39,6 +52,11 @@ llm:
   prompting:
     strategy: "few-shot" # zero-shot, few-shot, chain-of-thought
     context_window: 2
+
+# Asymmetric confidence routing thresholds
+routing:
+  hmm_confidence_threshold: 0.85
+  phobert_confidence_threshold: 0.70
 
 # data & file management
 paths:

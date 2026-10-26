@@ -70,8 +70,8 @@ def load_config(config_path: str = "config.yaml") -> dict:
 class VietnameseNLPPipeline:
     """
     Two-stage Vietnamese NLP Pipeline with Asymmetric Confidence-Based Routing:
-      Stage 1: Word Segmentation ('hmm', 'phobert', 'hybrid', 'cascade', 'pyvi', 'underthesea', 'llm')
-      Stage 2: POS Tagging ('hmm', 'phobert', 'pyvi', 'underthesea', 'llm')
+      Stage 1: Word Segmentation ('hmm', 'phobert', 'hybrid', 'cascade', 'cascade_qwen', 'cascade_llama', 'qwen', 'llama', 'pyvi', 'underthesea', 'llm')
+      Stage 2: POS Tagging ('hmm', 'phobert', 'pyvi', 'underthesea', 'qwen', 'llama', 'llm')
     """
 
     def __init__(
@@ -82,6 +82,7 @@ class VietnameseNLPPipeline:
         device: Optional[str] = None,
         hmm_threshold: float = 0.85,
         phobert_threshold: float = 0.70,
+        llm_backend: str = "auto",
     ):
         self.config = load_config(config_path)
         self.ws_mode = ws_mode
@@ -89,6 +90,7 @@ class VietnameseNLPPipeline:
         self.device = device
         self.hmm_threshold = hmm_threshold
         self.phobert_threshold = phobert_threshold
+        self.llm_backend = llm_backend
 
         self.hmm_ws: Optional[ViterbiSegmenter] = None
         self.phobert_ws = None
@@ -110,6 +112,7 @@ class VietnameseNLPPipeline:
         hmm_cfg = self.config.get("hmm", {})
         phobert_cfg = self.config.get("phobert", {})
         llm_cfg = self.config.get("llm", {})
+        models_cfg = llm_cfg.get("models", {})
 
         ws_weights = hmm_cfg.get("ws_weights", "models/hmm_weights.json")
         pos_weights = hmm_cfg.get("pos_weights", "models/pos_hmm.json")
@@ -118,11 +121,11 @@ class VietnameseNLPPipeline:
         phobert_pos_ckpt = phobert_cfg.get("pos_checkpoint", "models/phobert_pos")
         max_len = int(phobert_cfg.get("max_length", 256))
 
-        if self.ws_mode in ("hmm", "hybrid", "cascade"):
+        if self.ws_mode in ("hmm", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
             if os.path.exists(ws_weights):
                 self.hmm_ws = ViterbiSegmenter(weights_path=ws_weights)
 
-        if self.ws_mode in ("phobert", "hybrid", "cascade"):
+        if self.ws_mode in ("phobert", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
             from llm.phobert import PhoBERTWordSegmenter
 
             ws_model_path = phobert_ws_ckpt if os.path.exists(phobert_ws_ckpt) else phobert_base
@@ -132,13 +135,20 @@ class VietnameseNLPPipeline:
                 device=self.device,
             )
 
-        if self.ws_mode in ("llm", "cascade") or self.pos_mode == "llm":
+        llm_modes = ("llm", "qwen", "llama", "cascade", "cascade_qwen", "cascade_llama")
+        if self.ws_mode in llm_modes or self.pos_mode in ("llm", "qwen", "llama"):
+            family = "qwen" if ("qwen" in self.ws_mode or "qwen" in self.pos_mode) else "llama"
+            fam_cfg = models_cfg.get(family, {})
             self.llm_client = LLMWordSegmenterClient(
-                primary_model=llm_cfg.get("primary_model", "groq/llama-3.1-70b-versatile"),
-                fallback_model=llm_cfg.get("fallback_model", "gemini/gemini-1.5-flash"),
+                model_family=family,
+                primary_model=fam_cfg.get("api_model") or llm_cfg.get("primary_model"),
+                fallback_model=fam_cfg.get("ollama_model") or llm_cfg.get("fallback_model"),
+                hf_model=fam_cfg.get("hf_model"),
+                backend=self.llm_backend,
                 strategy=llm_cfg.get("prompting", {}).get("strategy", "few-shot"),
                 temperature=float(llm_cfg.get("params", {}).get("temperature", 0.0)),
                 max_tokens=int(llm_cfg.get("params", {}).get("max_tokens", 512)),
+                device=self.device,
             )
 
         if self.pos_mode == "hmm":
@@ -180,7 +190,7 @@ class VietnameseNLPPipeline:
             except Exception:
                 pass
 
-        if self.ws_mode == "llm" and self.llm_client is not None:
+        if self.ws_mode in ("llm", "qwen", "llama") and self.llm_client is not None:
             self.routing_stats["tier3_llm_syllables"] += len(syllables)
             return self.llm_client.segment(text.strip())
 
@@ -192,7 +202,7 @@ class VietnameseNLPPipeline:
             self.routing_stats["tier2_phobert_syllables"] += len(syllables)
             return self.phobert_ws.segment(text)
 
-        if self.ws_mode in ("hybrid", "cascade"):
+        if self.ws_mode in ("hybrid", "cascade", "cascade_qwen", "cascade_llama"):
             if self.hmm_ws is not None and self.phobert_ws is not None:
                 _, hmm_tags, hmm_confs = self.hmm_ws.segment_with_confidence(text)
                 # Identify low-confidence or OOV syllable positions (plus their immediate neighbors)
@@ -212,9 +222,9 @@ class VietnameseNLPPipeline:
                 pb_tags, pb_confs = self.phobert_ws.predict_tags_with_confidence(syllables)
                 llm_tags: Optional[List[str]] = None
 
-                # Tier 3 escalation in 'cascade' mode when PhoBERT confidence is also below threshold
+                # Tier 3 escalation in 'cascade*' mode when PhoBERT confidence is also below threshold
                 very_uncertain = [idx for idx in uncertain_indices if pb_confs[idx] < self.phobert_threshold]
-                if self.ws_mode == "cascade" and very_uncertain and self.llm_client is not None:
+                if self.ws_mode.startswith("cascade") and very_uncertain and self.llm_client is not None:
                     llm_seg = self.llm_client.segment(text.strip(), ambiguous_indices=sorted(very_uncertain))
                     cand_tags = [
                         "B" if sub_i == 0 else "I"
@@ -278,7 +288,7 @@ class VietnameseNLPPipeline:
             except Exception:
                 pass
 
-        if self.pos_mode == "llm" and self.llm_client is not None:
+        if self.pos_mode in ("llm", "qwen", "llama") and self.llm_client is not None:
             return self.llm_client.tag_segmented(segmented_text)
 
         if self.pos_mode == "hmm" and self.hmm_pos is not None:
@@ -546,12 +556,49 @@ def run_full_evaluation(
             )
         )
 
-        # 6. 3-Tier Asymmetric Cascade (HMM -> PhoBERT -> LLM/Dict Fallback)
-        cascade_pipe = VietnameseNLPPipeline(ws_mode="cascade", pos_mode="phobert")
+        # 6. Standalone Qwen vs. Llama LLM Segmenters
+        qwen_pipe = VietnameseNLPPipeline(ws_mode="qwen", pos_mode="phobert")
         results.append(
             _evaluate_single_pipeline(
-                "cascade_3tier",
-                cascade_pipe,
+                "qwen_llm",
+                qwen_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+
+        llama_pipe = VietnameseNLPPipeline(ws_mode="llama", pos_mode="phobert")
+        results.append(
+            _evaluate_single_pipeline(
+                "llama_llm",
+                llama_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+
+        # 7. 3-Tier Asymmetric Cascades (HMM -> PhoBERT -> Qwen vs. Llama)
+        cascade_qwen_pipe = VietnameseNLPPipeline(ws_mode="cascade_qwen", pos_mode="phobert")
+        results.append(
+            _evaluate_single_pipeline(
+                "cascade_3tier_qwen",
+                cascade_qwen_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+
+        cascade_llama_pipe = VietnameseNLPPipeline(ws_mode="cascade_llama", pos_mode="phobert")
+        results.append(
+            _evaluate_single_pipeline(
+                "cascade_3tier_llama",
+                cascade_llama_pipe,
                 raw_test_sentences,
                 gold_ws_sentences,
                 gold_pos_sentences,

@@ -1,7 +1,9 @@
 import argparse
+import json
 import os
 
 from data.dataset_converter import prepare_dataset
+from llm.client import compare_tokenization_fertility
 from pipeline import (
     VietnameseNLPPipeline,
     load_config,
@@ -26,13 +28,13 @@ def print_evaluation_table(results):
         "e2e_f1",
     ]
     print(
-        f"{headers[0]:<20}{headers[1]:>9}{headers[2]:>9}{headers[3]:>9}"
+        f"{headers[0]:<22}{headers[1]:>9}{headers[2]:>9}{headers[3]:>9}"
         f"{headers[4]:>9}{headers[5]:>9}{headers[6]:>9}{headers[7]:>9}"
     )
-    print("-" * 83)
+    print("-" * 85)
     for row in results:
         print(
-            f"{row['model']:<20}"
+            f"{row['model']:<22}"
             f"{row['ws_precision']:>9.4f}"
             f"{row['ws_recall']:>9.4f}"
             f"{row['ws_f1']:>9.4f}"
@@ -98,7 +100,25 @@ def main():
         help="Evaluate only the HMM baseline without loading PhoBERT",
     )
 
-    # 4. demo
+    # 4. benchmark-llm
+    p_llm = sub.add_parser(
+        "benchmark-llm",
+        help="Head-to-head benchmark of Qwen vs. Llama (standalone and 3-tier cascade) plus Tokenization Tax fertility",
+    )
+    p_llm.add_argument(
+        "--backend",
+        choices=["auto", "api", "hf", "offline"],
+        default="auto",
+        help="LLM execution backend ('api' for Groq/LiteLLM, 'hf' for local HuggingFace, 'offline' for dictionary profile)",
+    )
+    p_llm.add_argument(
+        "--strategy",
+        choices=["zero-shot", "few-shot", "chain-of-thought"],
+        default=None,
+        help="Prompting strategy override",
+    )
+
+    # 5. demo
     p_demo = sub.add_parser("demo", help="Run the full WS + POS pipeline on sample text")
     p_demo.add_argument(
         "--text",
@@ -107,12 +127,24 @@ def main():
     )
     p_demo.add_argument(
         "--ws-mode",
-        choices=["hmm", "phobert", "hybrid", "cascade", "pyvi", "underthesea", "llm"],
+        choices=[
+            "hmm",
+            "phobert",
+            "hybrid",
+            "cascade",
+            "cascade_qwen",
+            "cascade_llama",
+            "qwen",
+            "llama",
+            "pyvi",
+            "underthesea",
+            "llm",
+        ],
         default="phobert",
     )
     p_demo.add_argument(
         "--pos-mode",
-        choices=["hmm", "phobert", "pyvi", "underthesea", "llm"],
+        choices=["hmm", "phobert", "pyvi", "underthesea", "qwen", "llama", "llm"],
         default="phobert",
     )
 
@@ -152,6 +184,42 @@ def main():
         log_path = paths_cfg.get("logs", "logs/experiment_results.csv")
         if os.path.exists(log_path):
             print(f"\nSaved comparison metrics to {log_path}")
+
+    elif args.command == "benchmark-llm":
+        if args.strategy:
+            config.setdefault("llm", {}).setdefault("prompting", {})["strategy"] = args.strategy
+        results = run_full_evaluation(config, include_phobert=True)
+        llm_rows = [r for r in results if any(k in r["model"] for k in ("qwen", "llama", "phobert", "hmm"))]
+        print("=== Qwen vs. Llama vs. PhoBERT Benchmark ===")
+        print_evaluation_table(llm_rows)
+
+        ws_splits_path = paths_cfg.get("ws_splits", "data/processed/ws_splits.json")
+        if os.path.exists(ws_splits_path):
+            with open(ws_splits_path, "r", encoding="utf-8") as f:
+                ws_splits = json.load(f)
+            all_seg_sents = [
+                s["segmented_text"]
+                for split_list in ws_splits.values()
+                for s in split_list
+            ]
+            models_cfg = config.get("llm", {}).get("models", {})
+            fertility = compare_tokenization_fertility(
+                sentences=all_seg_sents,
+                qwen_tokenizer_id=models_cfg.get("qwen", {}).get("tokenizer_id", "Qwen/Qwen2.5-1.5B-Instruct"),
+                llama_tokenizer_id=models_cfg.get("llama", {}).get("tokenizer_id", "Xenova/llama3-tokenizer"),
+                phobert_tokenizer_id=config.get("phobert", {}).get("model_name", "vinai/phobert-base"),
+            )
+            print("\n=== Vietnamese Tokenization Tax (Subword Fertility) ===")
+            for fam, info in fertility.items():
+                if "tokens_per_syllable" in info:
+                    print(
+                        f"  {fam:<10} ({info['tokenizer_id']}): "
+                        f"{info['tokens_per_syllable']:.4f} subwords/syllable | "
+                        f"{info['tokens_per_word']:.4f} subwords/word "
+                        f"(total={info['total_subwords']} subwords)"
+                    )
+                else:
+                    print(f"  {fam:<10} ({info['tokenizer_id']}): unavailable ({info.get('error', '')[:60]})")
 
     elif args.command == "demo":
         pipe = VietnameseNLPPipeline(

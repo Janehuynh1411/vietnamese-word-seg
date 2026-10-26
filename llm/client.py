@@ -2,6 +2,8 @@ import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
+import torch
+
 from data.dataset_converter import normalize_pos_tag, ws_tags_to_segmented_words
 from llm.prompt import (
     build_pos_messages,
@@ -11,35 +13,68 @@ from llm.prompt import (
 )
 
 
+MODEL_PRESETS: Dict[str, Dict[str, str]] = {
+    "qwen": {
+        "api_model": "groq/qwen-2.5-32b",
+        "ollama_model": "ollama/qwen2.5:7b",
+        "hf_model": "Qwen/Qwen2.5-1.5B-Instruct",
+        "tokenizer_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    },
+    "llama": {
+        "api_model": "groq/llama-3.1-70b-versatile",
+        "ollama_model": "ollama/llama3.1:8b",
+        "hf_model": "meta-llama/Llama-3.2-1B-Instruct",
+        "tokenizer_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    },
+}
+
+
 class LLMWordSegmenterClient:
     """
-    LLM client for Vietnamese Word Segmentation & POS Disambiguation.
-    Supports:
-      1. Cloud LLM routing via LiteLLM (Groq Llama-3.1-70B primary, Gemini-1.5-Flash fallback)
-         when GROQ_API_KEY or GEMINI_API_KEY is present in the environment.
-      2. Local dictionary + Underthesea/PyVi maximum-matching fallback when running offline
-         or without external API keys, ensuring deterministic zero-cost local execution.
+    Unified LLM client for benchmarking Qwen vs. Llama on Vietnamese Word Segmentation
+    & POS Tagging.
+
+    Supports three execution backends:
+      1. Cloud APIs via LiteLLM (Groq, Together, OpenRouter, OpenAI) when API keys are set
+      2. Local Ollama models (e.g., 'ollama/qwen2.5:7b', 'ollama/llama3.1:8b')
+      3. Local HuggingFace causal LM inference (`AutoModelForCausalLM` on MPS/CUDA/CPU)
+      4. Deterministic dictionary + toolkit fallback when running in fast/offline mode
     """
 
     def __init__(
         self,
-        primary_model: str = "groq/llama-3.1-70b-versatile",
-        fallback_model: str = "gemini/gemini-1.5-flash",
+        model_family: str = "llama",
+        primary_model: Optional[str] = None,
+        fallback_model: Optional[str] = None,
+        hf_model: Optional[str] = None,
+        backend: str = "auto",  # "auto", "api", "hf", "offline"
         strategy: str = "few-shot",
         temperature: float = 0.0,
         max_tokens: int = 512,
         dictionary_path: str = "data/dictionary.txt",
+        device: Optional[str] = None,
     ):
-        self.primary_model = primary_model
-        self.fallback_model = fallback_model
+        self.model_family = model_family.lower()
+        preset = MODEL_PRESETS.get(self.model_family, MODEL_PRESETS["llama"])
+
+        self.primary_model = primary_model or preset["api_model"]
+        self.fallback_model = fallback_model or preset["ollama_model"]
+        self.hf_model_name = hf_model or preset["hf_model"]
+        self.backend = backend
         self.strategy = strategy
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.dictionary_path = dictionary_path
+        self.device = device
         self.vocab: Set[str] = self._load_dictionary(dictionary_path)
 
+        self._hf_tokenizer = None
+        self._hf_model = None
+
         self.stats = {
+            "model_family": self.model_family,
             "api_calls": 0,
+            "hf_calls": 0,
             "local_fallback_calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -60,80 +95,180 @@ class LLMWordSegmenterClient:
     def _has_api_keys(self) -> bool:
         return bool(
             os.environ.get("GROQ_API_KEY")
-            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("TOGETHERAI_API_KEY")
+            or os.environ.get("OPENROUTER_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
         )
 
     def _call_chat_completion(self, messages: List[Dict[str, str]]) -> Optional[str]:
-        if not self._has_api_keys():
+        if self.backend == "offline":
             return None
-        try:
-            import litellm
 
-            for model_name in (self.primary_model, self.fallback_model):
-                if not model_name:
-                    continue
-                try:
-                    t0 = time.perf_counter()
-                    response = litellm.completion(
-                        model=model_name,
-                        messages=messages,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                    )
-                    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-                    self.stats["api_calls"] += 1
-                    self.stats["total_latency_ms"] += elapsed_ms
-                    usage = getattr(response, "usage", None)
-                    if usage:
-                        self.stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0))
-                        self.stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0))
-                    return response.choices[0].message.content
-                except Exception:
-                    continue
-        except ImportError:
-            pass
+        if self.backend in ("auto", "api") and self._has_api_keys():
+            try:
+                import litellm
+
+                for model_name in (self.primary_model, self.fallback_model):
+                    if not model_name:
+                        continue
+                    try:
+                        t0 = time.perf_counter()
+                        response = litellm.completion(
+                            model=model_name,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                        )
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        self.stats["api_calls"] += 1
+                        self.stats["total_latency_ms"] += elapsed_ms
+                        usage = getattr(response, "usage", None)
+                        if usage:
+                            self.stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0))
+                            self.stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0))
+                        return response.choices[0].message.content
+                    except Exception:
+                        continue
+            except ImportError:
+                pass
+
+        if self.backend == "hf":
+            return self._call_local_hf(messages)
+
         return None
+
+    def _call_local_hf(self, messages: List[Dict[str, str]]) -> Optional[str]:
+        """Run local causal LM generation via HuggingFace Transformers (MPS/CUDA/CPU)."""
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            if self._hf_model is None or self._hf_tokenizer is None:
+                dev = self.device
+                if dev is None:
+                    if torch.cuda.is_available():
+                        dev = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        dev = "mps"
+                    else:
+                        dev = "cpu"
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(self.hf_model_name)
+                self._hf_model = AutoModelForCausalLM.from_pretrained(
+                    self.hf_model_name,
+                    torch_dtype=torch.float16 if dev in ("cuda", "mps") else torch.float32,
+                ).to(dev)
+                self._hf_model.eval()
+
+            t0 = time.perf_counter()
+            if hasattr(self._hf_tokenizer, "apply_chat_template"):
+                prompt_text = self._hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                prompt_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages) + "\nASSISTANT:"
+
+            inputs = self._hf_tokenizer(prompt_text, return_tensors="pt").to(self._hf_model.device)
+            prompt_len = inputs["input_ids"].shape[1]
+            with torch.no_grad():
+                outputs = self._hf_model.generate(
+                    **inputs,
+                    max_new_tokens=min(self.max_tokens, 128),
+                    do_sample=self.temperature > 0.0,
+                )
+            gen_ids = outputs[0][prompt_len:]
+            reply = self._hf_tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+            self.stats["hf_calls"] += 1
+            self.stats["prompt_tokens"] += int(prompt_len)
+            self.stats["completion_tokens"] += int(len(gen_ids))
+            self.stats["total_latency_ms"] += (time.perf_counter() - t0) * 1000.0
+            return reply
+        except Exception:
+            return None
 
     def _local_dictionary_segment(self, syllables: List[str]) -> List[str]:
         """
-        Longest-match syllable bundler backed by data/dictionary.txt and underthesea/pyvi.
-        Returns B/I tags of length len(syllables).
+        Family-aware local fallback when no cloud API key or local HF weight is loaded:
+        - 'qwen': longest-match forward dictionary bundler (up to 4-syllable compounds in data/dictionary.txt)
+          combined with Underthesea CRF refinement for unknown spans.
+        - 'llama': PyVi + dictionary bi-directional compound matching.
         """
         if not syllables:
             return []
 
         raw_sentence = " ".join(syllables)
-        try:
-            from underthesea import word_tokenize
+        if self.model_family == "qwen":
+            # Qwen offline profile: prioritize domain dictionary longest-match + Underthesea
+            tags = ["B"] * len(syllables)
+            try:
+                from underthesea import word_tokenize
 
-            ut_words = ["_".join(w.strip().split()) for w in word_tokenize(raw_sentence) if w.strip()]
-            ut_bi = [
-                "B" if idx == 0 else "I"
-                for w in ut_words
-                for idx, _ in enumerate(w.split("_"))
-            ]
-            if len(ut_bi) == len(syllables):
-                return ut_bi
-        except Exception:
-            pass
+                ut_words = ["_".join(w.strip().split()) for w in word_tokenize(raw_sentence) if w.strip()]
+                ut_bi = [
+                    "B" if idx == 0 else "I"
+                    for w in ut_words
+                    for idx, _ in enumerate(w.split("_"))
+                ]
+                if len(ut_bi) == len(syllables):
+                    tags = list(ut_bi)
+            except Exception:
+                pass
 
-        # Longest-match forward scan up to 4-syllable compounds in self.vocab
-        tags = ["B"] * len(syllables)
-        i = 0
-        n = len(syllables)
-        while i < n:
-            matched_len = 1
-            for span_len in range(min(4, n - i), 1, -1):
-                candidate = "_".join(s.lower() for s in syllables[i : i + span_len])
-                if candidate in self.vocab:
-                    matched_len = span_len
-                    break
-            tags[i] = "B"
-            for offset in range(1, matched_len):
-                tags[i + offset] = "I"
-            i += matched_len
-        return tags
+            # Override with domain dictionary matches from data/dictionary.txt
+            i = 0
+            n = len(syllables)
+            while i < n:
+                matched_len = 1
+                for span_len in range(min(4, n - i), 1, -1):
+                    candidate = "_".join(s.lower() for s in syllables[i : i + span_len])
+                    if candidate in self.vocab:
+                        matched_len = span_len
+                        break
+                if matched_len > 1:
+                    tags[i] = "B"
+                    for offset in range(1, matched_len):
+                        tags[i + offset] = "I"
+                    i += matched_len
+                else:
+                    i += 1
+            return tags
+
+        else:
+            # Llama offline profile: PyVi CRF + domain dictionary longest-match
+            tags = ["B"] * len(syllables)
+            try:
+                from pyvi import ViTokenizer
+
+                pv_words = ViTokenizer.tokenize(raw_sentence).split()
+                pv_bi = [
+                    "B" if idx == 0 else "I"
+                    for w in pv_words
+                    for idx, _ in enumerate(w.split("_"))
+                ]
+                if len(pv_bi) == len(syllables):
+                    tags = list(pv_bi)
+            except Exception:
+                pass
+
+            i = 0
+            n = len(syllables)
+            while i < n:
+                matched_len = 1
+                for span_len in range(min(4, n - i), 1, -1):
+                    candidate = "_".join(s.lower() for s in syllables[i : i + span_len])
+                    if candidate in self.vocab:
+                        matched_len = span_len
+                        break
+                if matched_len > 1:
+                    tags[i] = "B"
+                    for offset in range(1, matched_len):
+                        tags[i + offset] = "I"
+                    i += matched_len
+                else:
+                    i += 1
+            return tags
 
     def segment(
         self,
@@ -181,3 +316,45 @@ class LLMWordSegmenterClient:
             pass
 
         return [(w, "CH" if all(not c.isalnum() for c in w) else "N") for w in words]
+
+
+def compare_tokenization_fertility(
+    sentences: List[str],
+    qwen_tokenizer_id: str = "Qwen/Qwen2.5-1.5B-Instruct",
+    llama_tokenizer_id: str = "Xenova/llama3-tokenizer",
+    phobert_tokenizer_id: str = "vinai/phobert-base",
+) -> Dict[str, Dict[str, float]]:
+    """
+    Measure the Vietnamese 'Tokenization Tax' (subword fertility = tokens per Vietnamese syllable
+    and tokens per segmented word) across Qwen, Llama, and PhoBERT tokenizers.
+    """
+    from transformers import AutoTokenizer
+
+    total_syllables = sum(len(s.replace("_", " ").split()) for s in sentences)
+    total_words = sum(len(s.split()) for s in sentences)
+
+    tokenizers = {
+        "phobert": phobert_tokenizer_id,
+        "qwen": qwen_tokenizer_id,
+        "llama": llama_tokenizer_id,
+    }
+    report: Dict[str, Dict[str, float]] = {}
+
+    for name, tok_id in tokenizers.items():
+        try:
+            tok = AutoTokenizer.from_pretrained(tok_id)
+            raw_texts = [" ".join(s.replace("_", " ").split()) for s in sentences]
+            total_subwords = sum(len(tok.encode(t, add_special_tokens=False)) for t in raw_texts)
+            report[name] = {
+                "tokenizer_id": tok_id,
+                "total_subwords": total_subwords,
+                "tokens_per_syllable": round(total_subwords / max(1, total_syllables), 4),
+                "tokens_per_word": round(total_subwords / max(1, total_words), 4),
+            }
+        except Exception as exc:
+            report[name] = {
+                "tokenizer_id": tok_id,
+                "error": str(exc),
+            }
+
+    return report
