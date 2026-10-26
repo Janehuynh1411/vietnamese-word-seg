@@ -66,6 +66,29 @@ def ws_tags_to_segmented_words(syllables: List[str], tags: List[str]) -> List[st
     return words
 
 
+def normalize_pos_tag(tag: str) -> str:
+    """
+    Normalize POS tags across HumanSignal / Label Studio, Underthesea, PyVi, and VLSP.
+    Unifies punctuation tags ('CH', 'F', 'PU') to 'CH' and extracts short codes from
+    verbose Label Studio labels such as 'N (Danh từ / Noun)'.
+    """
+    if not tag:
+        return "N"
+    short = tag.strip().split()[0]
+    mapping = {
+        "F": "CH",
+        "PU": "CH",
+        "PUNCT": "CH",
+        "Nb": "N",
+        "Ny": "Np",
+        "Vb": "V",
+        "Cc": "C",
+        "CC": "C",
+        "S": "E",
+    }
+    return mapping.get(short, short)
+
+
 def parse_pos_line(line: str) -> Optional[Tuple[List[str], List[str]]]:
     """
     Parse a line of 'word/POS word/POS' into (words, pos_tags).
@@ -83,7 +106,7 @@ def parse_pos_line(line: str) -> Optional[Tuple[List[str], List[str]]]:
         if not word or not tag:
             return None
         words.append(word)
-        pos_tags.append(tag)
+        pos_tags.append(normalize_pos_tag(tag))
     return words, pos_tags
 
 
@@ -98,7 +121,7 @@ def silver_annotate_sentence(sentence: str) -> Tuple[List[str], List[str]]:
 
         tagged = pos_tag(sentence)
         words = ["_".join(w.strip().split()) for w, _ in tagged if w.strip()]
-        tags = [t for w, t in tagged if w.strip()]
+        tags = [normalize_pos_tag(t) for w, t in tagged if w.strip()]
         if words and len(words) == len(tags):
             return words, tags
     except Exception:
@@ -110,7 +133,7 @@ def silver_annotate_sentence(sentence: str) -> Tuple[List[str], List[str]]:
         tokenized = ViTokenizer.tokenize(sentence)
         words, tags = ViPosTagger.postagging(tokenized)
         if words and len(words) == len(tags):
-            return list(words), list(tags)
+            return list(words), [normalize_pos_tag(t) for t in tags]
     except Exception:
         pass
 
@@ -216,8 +239,7 @@ def parse_label_studio_task(task: dict, use_silver_fallback: bool = True) -> Opt
                 clean_span = "_".join(span_text.strip().split())
                 if clean_span:
                     words.append(clean_span)
-                    short_lbl = lbl.split()[0] if lbl else "N"
-                    pos_tags.append(short_lbl)
+                    pos_tags.append(normalize_pos_tag(lbl))
                 cursor = max(cursor, end)
             if cursor < len(text):
                 tail = text[cursor:].strip()
@@ -246,15 +268,16 @@ def parse_label_studio_task(task: dict, use_silver_fallback: bool = True) -> Opt
 
 
 def make_record(words: List[str], pos_tags: List[str]) -> dict:
+    norm_tags = [normalize_pos_tag(t) for t in pos_tags]
     syllables, ws_tags = segmented_words_to_ws_tags(words)
     return {
         "words": words,
-        "pos_tags": pos_tags,
+        "pos_tags": norm_tags,
         "syllables": syllables,
         "ws_tags": ws_tags,
         "segmented_text": " ".join(words),
         "raw_text": " ".join(syllables),
-        "pos_text": " ".join(f"{w}/{t}" for w, t in zip(words, pos_tags)),
+        "pos_text": " ".join(f"{w}/{t}" for w, t in zip(words, norm_tags)),
     }
 
 
@@ -429,6 +452,21 @@ def save_processed_splits(
     with open(pos_test_txt, "w", encoding="utf-8") as f:
         f.write("\n".join(r["pos_text"] for r in splits["test"]) + "\n")
 
+    # Populate data/dictionary.txt from unique segmented words across splits
+    dict_path = "data/dictionary.txt"
+    os.makedirs(os.path.dirname(dict_path) or ".", exist_ok=True)
+    vocab_words = sorted(
+        {
+            w.lower()
+            for split_list in splits.values()
+            for r in split_list
+            for w in r["words"]
+            if any(c.isalnum() for c in w)
+        }
+    )
+    with open(dict_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(vocab_words) + "\n")
+
     return {
         "ws_splits": ws_path,
         "pos_splits": pos_path,
@@ -436,6 +474,7 @@ def save_processed_splits(
         "test_txt": test_txt,
         "pos_train_txt": pos_train_txt,
         "pos_test_txt": pos_test_txt,
+        "dictionary": dict_path,
     }
 
 

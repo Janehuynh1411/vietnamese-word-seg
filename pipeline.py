@@ -8,10 +8,11 @@ try:
 except ImportError:
     yaml = None
 
-from data.dataset_converter import prepare_dataset, ws_tags_to_segmented_words
+from data.dataset_converter import normalize_pos_tag, prepare_dataset, ws_tags_to_segmented_words
 from eval.metrics import evaluate_pos_tagging, evaluate_word_segmentation
 from hmm.train import train_hmm
 from hmm.viterbi import ViterbiSegmenter
+from llm.client import LLMWordSegmenterClient
 from pos.tagger import HMMPosTagger, read_corpus
 
 
@@ -33,6 +34,21 @@ DEFAULT_CONFIG = {
         "ws_checkpoint": "models/phobert_ws",
         "pos_checkpoint": "models/phobert_pos",
     },
+    "llm": {
+        "primary_model": "groq/llama-3.1-70b-versatile",
+        "fallback_model": "gemini/gemini-1.5-flash",
+        "params": {
+            "temperature": 0.0,
+            "max_tokens": 512,
+        },
+        "prompting": {
+            "strategy": "few-shot",
+        },
+    },
+    "routing": {
+        "hmm_confidence_threshold": 0.85,
+        "phobert_confidence_threshold": 0.70,
+    },
     "paths": {
         "raw_data": "data/raw",
         "processed_data": "data/processed",
@@ -53,9 +69,9 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 class VietnameseNLPPipeline:
     """
-    Two-stage Vietnamese NLP Pipeline:
-      Stage 1: Word Segmentation ('hmm', 'phobert', 'hybrid', or 'pyvi')
-      Stage 2: POS Tagging ('hmm' or 'phobert')
+    Two-stage Vietnamese NLP Pipeline with Asymmetric Confidence-Based Routing:
+      Stage 1: Word Segmentation ('hmm', 'phobert', 'hybrid', 'cascade', 'pyvi', 'underthesea', 'llm')
+      Stage 2: POS Tagging ('hmm', 'phobert', 'pyvi', 'underthesea', 'llm')
     """
 
     def __init__(
@@ -64,22 +80,36 @@ class VietnameseNLPPipeline:
         pos_mode: str = "phobert",
         config_path: str = "config.yaml",
         device: Optional[str] = None,
+        hmm_threshold: float = 0.85,
+        phobert_threshold: float = 0.70,
     ):
         self.config = load_config(config_path)
         self.ws_mode = ws_mode
         self.pos_mode = pos_mode
         self.device = device
+        self.hmm_threshold = hmm_threshold
+        self.phobert_threshold = phobert_threshold
 
         self.hmm_ws: Optional[ViterbiSegmenter] = None
         self.phobert_ws = None
         self.hmm_pos: Optional[HMMPosTagger] = None
         self.phobert_pos = None
+        self.llm_client: Optional[LLMWordSegmenterClient] = None
+
+        self.routing_stats = {
+            "total_syllables": 0,
+            "tier1_hmm_syllables": 0,
+            "tier2_phobert_syllables": 0,
+            "tier3_llm_syllables": 0,
+            "sentences_processed": 0,
+        }
 
         self._init_models()
 
     def _init_models(self) -> None:
         hmm_cfg = self.config.get("hmm", {})
         phobert_cfg = self.config.get("phobert", {})
+        llm_cfg = self.config.get("llm", {})
 
         ws_weights = hmm_cfg.get("ws_weights", "models/hmm_weights.json")
         pos_weights = hmm_cfg.get("pos_weights", "models/pos_hmm.json")
@@ -88,11 +118,11 @@ class VietnameseNLPPipeline:
         phobert_pos_ckpt = phobert_cfg.get("pos_checkpoint", "models/phobert_pos")
         max_len = int(phobert_cfg.get("max_length", 256))
 
-        if self.ws_mode in ("hmm", "hybrid"):
+        if self.ws_mode in ("hmm", "hybrid", "cascade"):
             if os.path.exists(ws_weights):
                 self.hmm_ws = ViterbiSegmenter(weights_path=ws_weights)
 
-        if self.ws_mode in ("phobert", "hybrid"):
+        if self.ws_mode in ("phobert", "hybrid", "cascade"):
             from llm.phobert import PhoBERTWordSegmenter
 
             ws_model_path = phobert_ws_ckpt if os.path.exists(phobert_ws_ckpt) else phobert_base
@@ -100,6 +130,15 @@ class VietnameseNLPPipeline:
                 model_name_or_path=ws_model_path,
                 max_length=max_len,
                 device=self.device,
+            )
+
+        if self.ws_mode in ("llm", "cascade") or self.pos_mode == "llm":
+            self.llm_client = LLMWordSegmenterClient(
+                primary_model=llm_cfg.get("primary_model", "groq/llama-3.1-70b-versatile"),
+                fallback_model=llm_cfg.get("fallback_model", "gemini/gemini-1.5-flash"),
+                strategy=llm_cfg.get("prompting", {}).get("strategy", "few-shot"),
+                temperature=float(llm_cfg.get("params", {}).get("temperature", 0.0)),
+                max_tokens=int(llm_cfg.get("params", {}).get("max_tokens", 512)),
             )
 
         if self.pos_mode == "hmm":
@@ -121,6 +160,9 @@ class VietnameseNLPPipeline:
         if not syllables:
             return ""
 
+        self.routing_stats["sentences_processed"] += 1
+        self.routing_stats["total_syllables"] += len(syllables)
+
         if self.ws_mode == "pyvi":
             try:
                 from pyvi import ViTokenizer
@@ -129,38 +171,74 @@ class VietnameseNLPPipeline:
             except Exception:
                 pass
 
+        if self.ws_mode == "underthesea":
+            try:
+                from underthesea import word_tokenize
+
+                tokens = ["_".join(w.strip().split()) for w in word_tokenize(text.strip()) if w.strip()]
+                return " ".join(tokens)
+            except Exception:
+                pass
+
+        if self.ws_mode == "llm" and self.llm_client is not None:
+            self.routing_stats["tier3_llm_syllables"] += len(syllables)
+            return self.llm_client.segment(text.strip())
+
         if self.ws_mode == "hmm" and self.hmm_ws is not None:
+            self.routing_stats["tier1_hmm_syllables"] += len(syllables)
             return self.hmm_ws.segment(text)
 
         if self.ws_mode == "phobert" and self.phobert_ws is not None:
+            self.routing_stats["tier2_phobert_syllables"] += len(syllables)
             return self.phobert_ws.segment(text)
 
-        if self.ws_mode == "hybrid":
+        if self.ws_mode in ("hybrid", "cascade"):
             if self.hmm_ws is not None and self.phobert_ws is not None:
-                # Check if sentence has OOV syllables for HMM; if so, refine those positions with PhoBERT
-                known_syllables = set(self.hmm_ws.emissions.get("B", {}).keys()) | set(
-                    self.hmm_ws.emissions.get("I", {}).keys()
-                )
-                has_oov = any(s.lower() not in known_syllables for s in syllables)
-                if not has_oov:
-                    return self.hmm_ws.segment(text)
-                hmm_seg = self.hmm_ws.segment(text)
-                hmm_tags = [
-                    "B" if idx == 0 else "I"
-                    for w in hmm_seg.split()
-                    for idx, _ in enumerate(w.split("_"))
-                ]
-                phobert_tags = self.phobert_ws.predict_tags(syllables)
-                merged_tags = []
-                for idx, syll in enumerate(syllables):
+                _, hmm_tags, hmm_confs = self.hmm_ws.segment_with_confidence(text)
+                # Identify low-confidence or OOV syllable positions (plus their immediate neighbors)
+                uncertain_indices: Set[int] = set()
+                for idx, conf in enumerate(hmm_confs):
+                    if conf < self.hmm_threshold:
+                        uncertain_indices.add(idx)
+                        if idx > 0:
+                            uncertain_indices.add(idx - 1)
+                        if idx + 1 < len(syllables):
+                            uncertain_indices.add(idx + 1)
+
+                if not uncertain_indices:
+                    self.routing_stats["tier1_hmm_syllables"] += len(syllables)
+                    return " ".join(ws_tags_to_segmented_words(syllables, hmm_tags))
+
+                pb_tags, pb_confs = self.phobert_ws.predict_tags_with_confidence(syllables)
+                llm_tags: Optional[List[str]] = None
+
+                # Tier 3 escalation in 'cascade' mode when PhoBERT confidence is also below threshold
+                very_uncertain = [idx for idx in uncertain_indices if pb_confs[idx] < self.phobert_threshold]
+                if self.ws_mode == "cascade" and very_uncertain and self.llm_client is not None:
+                    llm_seg = self.llm_client.segment(text.strip(), ambiguous_indices=sorted(very_uncertain))
+                    cand_tags = [
+                        "B" if sub_i == 0 else "I"
+                        for w in llm_seg.split()
+                        for sub_i, _ in enumerate(w.split("_"))
+                    ]
+                    if len(cand_tags) == len(syllables):
+                        llm_tags = cand_tags
+
+                merged_tags: List[str] = []
+                for idx in range(len(syllables)):
                     if idx == 0:
                         merged_tags.append("B")
-                    elif syll.lower() not in known_syllables or (
-                        idx > 0 and syllables[idx - 1].lower() not in known_syllables
-                    ):
-                        merged_tags.append(phobert_tags[idx])
+                        self.routing_stats["tier1_hmm_syllables"] += 1
+                    elif idx in very_uncertain and llm_tags is not None:
+                        merged_tags.append(llm_tags[idx])
+                        self.routing_stats["tier3_llm_syllables"] += 1
+                    elif idx in uncertain_indices:
+                        merged_tags.append(pb_tags[idx])
+                        self.routing_stats["tier2_phobert_syllables"] += 1
                     else:
-                        merged_tags.append(hmm_tags[idx] if idx < len(hmm_tags) else phobert_tags[idx])
+                        merged_tags.append(hmm_tags[idx])
+                        self.routing_stats["tier1_hmm_syllables"] += 1
+
                 return " ".join(ws_tags_to_segmented_words(syllables, merged_tags))
             elif self.phobert_ws is not None:
                 return self.phobert_ws.segment(text)
@@ -173,11 +251,43 @@ class VietnameseNLPPipeline:
         words = segmented_text.strip().split()
         if not words:
             return []
+
+        if self.pos_mode == "pyvi":
+            try:
+                from pyvi import ViPosTagger
+
+                _, tags = ViPosTagger.postagging(" ".join(words))
+                if len(tags) == len(words):
+                    return [(w, normalize_pos_tag(t)) for w, t in zip(words, tags)]
+            except Exception:
+                pass
+
+        if self.pos_mode == "underthesea":
+            try:
+                from underthesea import pos_tag
+
+                raw = " ".join(w.replace("_", " ") for w in words)
+                tagged = pos_tag(raw)
+                ut_words = ["_".join(w.strip().split()) for w, _ in tagged if w.strip()]
+                ut_tags = [normalize_pos_tag(t) for w, t in tagged if w.strip()]
+                if len(ut_words) == len(words):
+                    return list(zip(words, ut_tags))
+                # Map by word lookup if segmentation differs slightly
+                tag_lookup = {uw.lower(): ut for uw, ut in zip(ut_words, ut_tags)}
+                return [(w, tag_lookup.get(w.lower(), "CH" if all(not c.isalnum() for c in w) else "N")) for w in words]
+            except Exception:
+                pass
+
+        if self.pos_mode == "llm" and self.llm_client is not None:
+            return self.llm_client.tag_segmented(segmented_text)
+
         if self.pos_mode == "hmm" and self.hmm_pos is not None:
-            return self.hmm_pos.tag(words)
+            return [(w, normalize_pos_tag(t)) for w, t in self.hmm_pos.tag(words)]
+
         if self.pos_mode == "phobert" and self.phobert_pos is not None:
-            return self.phobert_pos.tag(words)
-        return [(w, "N") for w in words]
+            return [(w, normalize_pos_tag(t)) for w, t in self.phobert_pos.tag(words)]
+
+        return [(w, "CH" if all(not c.isalnum() for c in w) else "N") for w in words]
 
     def process(self, text: str) -> Dict[str, object]:
         segmented = self.segment(text)
@@ -187,6 +297,7 @@ class VietnameseNLPPipeline:
             "segmented_text": segmented,
             "pos_tags": pos_tagged,
             "formatted_pos": " ".join(f"{w}/{t}" for w, t in pos_tagged),
+            "routing_stats": dict(self.routing_stats),
         }
 
 
@@ -290,6 +401,36 @@ def train_phobert_models(
     return saved
 
 
+def _evaluate_single_pipeline(
+    name: str,
+    pipe: VietnameseNLPPipeline,
+    raw_test_sentences: List[str],
+    gold_ws_sentences: List[str],
+    gold_pos_sentences: List[List[Tuple[str, str]]],
+    train_vocab: Set[str],
+) -> Dict[str, object]:
+    ws_preds = [pipe.segment(raw) for raw in raw_test_sentences]
+    ws_metrics = evaluate_word_segmentation(gold_ws_sentences, ws_preds, train_vocab=train_vocab)
+
+    pos_gold_seg = [pipe.tag_segmented(seg) for seg in gold_ws_sentences]
+    pos_e2e = [pipe.tag_segmented(seg) for seg in ws_preds]
+    pos_metrics = evaluate_pos_tagging(gold_pos_sentences, pos_gold_seg, train_vocab=train_vocab)
+    e2e_metrics = evaluate_pos_tagging(gold_pos_sentences, pos_e2e, train_vocab=train_vocab)
+
+    return {
+        "model": name,
+        "ws_precision": round(ws_metrics["precision"], 4),
+        "ws_recall": round(ws_metrics["recall"], 4),
+        "ws_f1": round(ws_metrics["f1_score"], 4),
+        "ws_oov_recall": round(ws_metrics["oov_recall"], 4),
+        "ws_bi_accuracy": round(ws_metrics["bi_accuracy"], 4),
+        "pos_accuracy": round(pos_metrics["accuracy"], 4),
+        "pos_macro_f1": round(pos_metrics["macro_f1"], 4),
+        "pos_oov_accuracy": round(pos_metrics["oov_accuracy"], 4),
+        "e2e_joint_f1": round(e2e_metrics["joint_f1"], 4),
+    }
+
+
 def run_full_evaluation(
     config: dict,
     include_phobert: bool = True,
@@ -325,82 +466,97 @@ def run_full_evaluation(
 
     results: List[Dict[str, object]] = []
 
-    # Ensure HMM weights exist
     hmm_cfg = config.get("hmm", {})
     if not os.path.exists(hmm_cfg.get("ws_weights", "models/hmm_weights.json")):
         train_hmm_models(config)
 
-    # 1. HMM Word Segmentation + HMM POS Tagging
+    # 1. HMM Baseline
     hmm_pipe = VietnameseNLPPipeline(ws_mode="hmm", pos_mode="hmm")
-    hmm_ws_preds = [hmm_pipe.segment(raw) for raw in raw_test_sentences]
-    hmm_ws_metrics = evaluate_word_segmentation(gold_ws_sentences, hmm_ws_preds, train_vocab=train_vocab)
-
-    hmm_pos_gold_seg = [hmm_pipe.tag_segmented(seg) for seg in gold_ws_sentences]
-    hmm_pos_e2e = [hmm_pipe.tag_segmented(seg) for seg in hmm_ws_preds]
-    hmm_pos_metrics = evaluate_pos_tagging(gold_pos_sentences, hmm_pos_gold_seg, train_vocab=train_vocab)
-    hmm_e2e_metrics = evaluate_pos_tagging(gold_pos_sentences, hmm_pos_e2e, train_vocab=train_vocab)
-
     results.append(
-        {
-            "model": "hmm",
-            "ws_precision": round(hmm_ws_metrics["precision"], 4),
-            "ws_recall": round(hmm_ws_metrics["recall"], 4),
-            "ws_f1": round(hmm_ws_metrics["f1_score"], 4),
-            "ws_oov_recall": round(hmm_ws_metrics["oov_recall"], 4),
-            "ws_bi_accuracy": round(hmm_ws_metrics["bi_accuracy"], 4),
-            "pos_accuracy": round(hmm_pos_metrics["accuracy"], 4),
-            "pos_macro_f1": round(hmm_pos_metrics["macro_f1"], 4),
-            "pos_oov_accuracy": round(hmm_pos_metrics["oov_accuracy"], 4),
-            "e2e_joint_f1": round(hmm_e2e_metrics["joint_f1"], 4),
-        }
+        _evaluate_single_pipeline(
+            "hmm",
+            hmm_pipe,
+            raw_test_sentences,
+            gold_ws_sentences,
+            gold_pos_sentences,
+            train_vocab,
+        )
     )
 
-    if include_phobert:
-        # 2. PhoBERT Word Segmentation + PhoBERT POS Tagging
-        phobert_pipe = VietnameseNLPPipeline(ws_mode="phobert", pos_mode="phobert")
-        pb_ws_preds = [phobert_pipe.segment(raw) for raw in raw_test_sentences]
-        pb_ws_metrics = evaluate_word_segmentation(gold_ws_sentences, pb_ws_preds, train_vocab=train_vocab)
+    # 2. PyVi Baseline (from config.yaml baseline_comparison: "pyvi")
+    try:
+        import pyvi  # noqa: F401
 
-        pb_pos_gold_seg = [phobert_pipe.tag_segmented(seg) for seg in gold_ws_sentences]
-        pb_pos_e2e = [phobert_pipe.tag_segmented(seg) for seg in pb_ws_preds]
-        pb_pos_metrics = evaluate_pos_tagging(gold_pos_sentences, pb_pos_gold_seg, train_vocab=train_vocab)
-        pb_e2e_metrics = evaluate_pos_tagging(gold_pos_sentences, pb_pos_e2e, train_vocab=train_vocab)
-
+        pyvi_pipe = VietnameseNLPPipeline(ws_mode="pyvi", pos_mode="pyvi")
         results.append(
-            {
-                "model": "phobert",
-                "ws_precision": round(pb_ws_metrics["precision"], 4),
-                "ws_recall": round(pb_ws_metrics["recall"], 4),
-                "ws_f1": round(pb_ws_metrics["f1_score"], 4),
-                "ws_oov_recall": round(pb_ws_metrics["oov_recall"], 4),
-                "ws_bi_accuracy": round(pb_ws_metrics["bi_accuracy"], 4),
-                "pos_accuracy": round(pb_pos_metrics["accuracy"], 4),
-                "pos_macro_f1": round(pb_pos_metrics["macro_f1"], 4),
-                "pos_oov_accuracy": round(pb_pos_metrics["oov_accuracy"], 4),
-                "e2e_joint_f1": round(pb_e2e_metrics["joint_f1"], 4),
-            }
+            _evaluate_single_pipeline(
+                "pyvi_baseline",
+                pyvi_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+    except ImportError:
+        pass
+
+    # 3. Underthesea Baseline
+    try:
+        import underthesea  # noqa: F401
+
+        ut_pipe = VietnameseNLPPipeline(ws_mode="underthesea", pos_mode="underthesea")
+        results.append(
+            _evaluate_single_pipeline(
+                "underthesea_baseline",
+                ut_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+    except ImportError:
+        pass
+
+    if include_phobert:
+        # 4. PhoBERT (vinai/phobert-base)
+        phobert_pipe = VietnameseNLPPipeline(ws_mode="phobert", pos_mode="phobert")
+        results.append(
+            _evaluate_single_pipeline(
+                "phobert",
+                phobert_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
         )
 
-        # 3. Hybrid (HMM + PhoBERT OOV refinement)
+        # 5. Hybrid (HMM + PhoBERT Confidence Routing)
         hybrid_pipe = VietnameseNLPPipeline(ws_mode="hybrid", pos_mode="phobert")
-        hyb_ws_preds = [hybrid_pipe.segment(raw) for raw in raw_test_sentences]
-        hyb_ws_metrics = evaluate_word_segmentation(gold_ws_sentences, hyb_ws_preds, train_vocab=train_vocab)
-        hyb_pos_e2e = [hybrid_pipe.tag_segmented(seg) for seg in hyb_ws_preds]
-        hyb_e2e_metrics = evaluate_pos_tagging(gold_pos_sentences, hyb_pos_e2e, train_vocab=train_vocab)
-
         results.append(
-            {
-                "model": "hybrid_hmm_phobert",
-                "ws_precision": round(hyb_ws_metrics["precision"], 4),
-                "ws_recall": round(hyb_ws_metrics["recall"], 4),
-                "ws_f1": round(hyb_ws_metrics["f1_score"], 4),
-                "ws_oov_recall": round(hyb_ws_metrics["oov_recall"], 4),
-                "ws_bi_accuracy": round(hyb_ws_metrics["bi_accuracy"], 4),
-                "pos_accuracy": round(pb_pos_metrics["accuracy"], 4),
-                "pos_macro_f1": round(pb_pos_metrics["macro_f1"], 4),
-                "pos_oov_accuracy": round(pb_pos_metrics["oov_accuracy"], 4),
-                "e2e_joint_f1": round(hyb_e2e_metrics["joint_f1"], 4),
-            }
+            _evaluate_single_pipeline(
+                "hybrid_hmm_phobert",
+                hybrid_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
+        )
+
+        # 6. 3-Tier Asymmetric Cascade (HMM -> PhoBERT -> LLM/Dict Fallback)
+        cascade_pipe = VietnameseNLPPipeline(ws_mode="cascade", pos_mode="phobert")
+        results.append(
+            _evaluate_single_pipeline(
+                "cascade_3tier",
+                cascade_pipe,
+                raw_test_sentences,
+                gold_ws_sentences,
+                gold_pos_sentences,
+                train_vocab,
+            )
         )
 
     log_path = paths_cfg.get("logs", "logs/experiment_results.csv")

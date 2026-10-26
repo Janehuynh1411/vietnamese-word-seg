@@ -107,12 +107,12 @@ def main():
     )
     p_demo.add_argument(
         "--ws-mode",
-        choices=["hmm", "phobert", "hybrid", "pyvi"],
+        choices=["hmm", "phobert", "hybrid", "cascade", "pyvi", "underthesea", "llm"],
         default="phobert",
     )
     p_demo.add_argument(
         "--pos-mode",
-        choices=["hmm", "phobert"],
+        choices=["hmm", "phobert", "pyvi", "underthesea", "llm"],
         default="phobert",
     )
 

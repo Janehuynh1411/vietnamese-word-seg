@@ -281,9 +281,9 @@ class BasePhoBERTTokenClassifier:
                 steps += 1
         return total_loss / max(1, steps)
 
-    def predict_tokens(self, tokens: List[str]) -> List[str]:
+    def predict_tokens_with_confidence(self, tokens: List[str]) -> Tuple[List[str], List[float]]:
         if not tokens:
-            return []
+            return [], []
         self.model.eval()
         aligned = align_labels_with_tokens(
             tokenizer=self.tokenizer,
@@ -295,14 +295,23 @@ class BasePhoBERTTokenClassifier:
 
         with torch.no_grad():
             logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits[0]
-            pred_ids = torch.argmax(logits, dim=-1).cpu().tolist()
+            probs = torch.softmax(logits, dim=-1)
+            max_probs, pred_ids_tensor = torch.max(probs, dim=-1)
+            pred_ids = pred_ids_tensor.cpu().tolist()
+            conf_vals = max_probs.cpu().tolist()
 
         default_label = self.id2label.get(0, "B")
         predictions = [default_label] * len(tokens)
+        confidences = [0.5] * len(tokens)
         for sub_idx, word_idx in enumerate(aligned["word_ids"]):
             if word_idx is not None and 0 <= word_idx < len(tokens):
                 predictions[word_idx] = self.id2label.get(pred_ids[sub_idx], default_label)
+                confidences[word_idx] = float(conf_vals[sub_idx])
 
+        return predictions, confidences
+
+    def predict_tokens(self, tokens: List[str]) -> List[str]:
+        predictions, _ = self.predict_tokens_with_confidence(tokens)
         return predictions
 
     def save(self, save_dir: str) -> None:
@@ -336,6 +345,12 @@ class PhoBERTWordSegmenter(BasePhoBERTTokenClassifier):
         if tags:
             tags[0] = "B"
         return tags
+
+    def predict_tags_with_confidence(self, syllables: List[str]) -> Tuple[List[str], List[float]]:
+        tags, confs = self.predict_tokens_with_confidence(syllables)
+        if tags:
+            tags[0] = "B"
+        return tags, confs
 
     def predict_tags_raw(self, syllables: List[str]) -> List[str]:
         return self.predict_tokens(syllables)
