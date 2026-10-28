@@ -2,6 +2,8 @@ import os
 import json
 from collections import Counter, defaultdict
 
+UNK_TOKEN = "<UNK>"
+
 try:
     import yaml
 except ImportError:
@@ -32,43 +34,48 @@ def train_hmm(data_path):
     transitions = defaultdict(Counter)
     emissions = defaultdict(Counter)
     states = ['B', 'I']
-    
-    # Initialize counts to avoid zero division (Laplace Smoothing)
+    vocab = set()
+
+    # Add-one over the closed B/I transition space.
     for s1 in states:
         for s2 in states:
             transitions[s1][s2] = 1
-        for s in states:
-            emissions[s] = Counter()
 
     with open(data_path, 'r', encoding='utf-8') as f:
         for line in f:
             tagged_data = get_tags(line.strip())
             if not tagged_data:
                 continue
-                
-            # Count Transitions and Emissions
+
             for i in range(len(tagged_data)):
                 syllable, tag = tagged_data[i]
+                vocab.add(syllable)
                 emissions[tag][syllable] += 1
-                
+
                 if i > 0:
                     prev_tag = tagged_data[i-1][1]
                     transitions[prev_tag][tag] += 1
 
-    # Convert counts to probabilities
     model = {
         "transitions": {},
         "emissions": {},
-        "states": states
+        "states": states,
+        "unk_token": UNK_TOKEN,
     }
 
     for state, counts in transitions.items():
         total = sum(counts.values())
-        model["transitions"][state] = {next_state: c/total for next_state, c in counts.items()}
+        model["transitions"][state] = {next_state: c / total for next_state, c in counts.items()}
 
-    for state, counts in emissions.items():
-        total = sum(counts.values())
-        model["emissions"][state] = {syll: c/total for syll, c in counts.items()}
+    # Add-one over the observed syllable vocabulary plus an <UNK> bin, so unseen
+    # syllables keep a real probability instead of an arbitrary 1e-10 floor.
+    for state in states:
+        smoothed = Counter()
+        for syll in vocab:
+            smoothed[syll] = emissions[state][syll] + 1
+        smoothed[UNK_TOKEN] = 1
+        total = sum(smoothed.values()) or 1
+        model["emissions"][state] = {syll: c / total for syll, c in smoothed.items()}
 
     return model
 
