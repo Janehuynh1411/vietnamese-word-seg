@@ -1,10 +1,15 @@
+import json
 import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
-from data.dataset_converter import normalize_pos_tag, ws_tags_to_segmented_words
+from data.dataset_converter import (
+    normalize_pos_tag,
+    segmented_words_to_ws_tags,
+    ws_tags_to_segmented_words,
+)
 from llm.prompt import (
     build_pos_messages,
     build_ws_messages,
@@ -24,7 +29,7 @@ MODEL_PRESETS: Dict[str, Dict[str, str]] = {
         "api_model": "groq/llama-3.1-70b-versatile",
         "ollama_model": "ollama/llama3.1:8b",
         "hf_model": "meta-llama/Llama-3.2-1B-Instruct",
-        "tokenizer_id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "tokenizer_id": "meta-llama/Llama-3.2-1B-Instruct",
     },
 }
 
@@ -53,6 +58,7 @@ class LLMWordSegmenterClient:
         max_tokens: int = 512,
         dictionary_path: str = "data/dictionary.txt",
         device: Optional[str] = None,
+        dpo_memory_path: str = "models/llm_dpo_memory.json",
     ):
         self.model_family = model_family.lower()
         preset = MODEL_PRESETS.get(self.model_family, MODEL_PRESETS["llama"])
@@ -67,6 +73,8 @@ class LLMWordSegmenterClient:
         self.dictionary_path = dictionary_path
         self.device = device
         self.vocab: Set[str] = self._load_dictionary(dictionary_path)
+        self.dpo_memory_path = dpo_memory_path
+        self.preferred_compounds, self.rejected_compounds = self._load_dpo_memory(dpo_memory_path)
 
         self._hf_tokenizer = None
         self._hf_model = None
@@ -91,6 +99,38 @@ class LLMWordSegmenterClient:
                     if w:
                         vocab.add(w)
         return vocab
+
+    @staticmethod
+    def _load_dpo_memory(path: str) -> Tuple[Set[str], Set[str]]:
+        preferred: Set[str] = set()
+        rejected: Set[str] = set()
+        if not path or not os.path.exists(path):
+            return preferred, rejected
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            preferred = {str(item).strip().lower() for item in payload.get("preferred_compounds", []) if str(item).strip()}
+            rejected = {str(item).strip().lower() for item in payload.get("rejected_compounds", []) if str(item).strip()}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return set(), set()
+        return preferred, rejected
+
+    def _apply_dpo_rejected_filter(self, syllables: List[str], tags: List[str]) -> List[str]:
+        """Split any compound that preference data explicitly rejected."""
+        if not self.rejected_compounds or len(tags) != len(syllables):
+            return tags
+        words = ws_tags_to_segmented_words(syllables, tags)
+        rebuilt: List[str] = []
+        for word in words:
+            parts = [part for part in word.split("_") if part]
+            if word.lower() in self.rejected_compounds and len(parts) > 1:
+                rebuilt.extend(["B"] * len(parts))
+            else:
+                rebuilt.append("B")
+                rebuilt.extend(["I"] * (len(parts) - 1))
+        if len(rebuilt) != len(syllables):
+            return tags
+        return rebuilt
 
     def _has_api_keys(self) -> bool:
         return bool(
@@ -283,14 +323,22 @@ class LLMWordSegmenterClient:
             raw_sentence=raw_sentence,
             strategy=self.strategy,
             ambiguous_indices=ambiguous_indices,
+            preferred_compounds=self.preferred_compounds,
+            rejected_compounds=self.rejected_compounds,
         )
         llm_reply = self._call_chat_completion(messages)
         if llm_reply is not None:
-            return parse_llm_ws_output(llm_reply, raw_sentence)
+            parsed = parse_llm_ws_output(llm_reply, raw_sentence)
+            parsed_syllables, parsed_tags = segmented_words_to_ws_tags(parsed.split())
+            if [s.lower() for s in parsed_syllables] == [s.lower() for s in syllables] and len(parsed_tags) == len(syllables):
+                filtered = self._apply_dpo_rejected_filter(syllables, parsed_tags)
+                return " ".join(ws_tags_to_segmented_words(syllables, filtered))
+            return parsed
 
         t0 = time.perf_counter()
         self.stats["local_fallback_calls"] += 1
         bi_tags = self._local_dictionary_segment(syllables)
+        bi_tags = self._apply_dpo_rejected_filter(syllables, bi_tags)
         self.stats["total_latency_ms"] += (time.perf_counter() - t0) * 1000.0
         return " ".join(ws_tags_to_segmented_words(syllables, bi_tags))
 
@@ -321,7 +369,7 @@ class LLMWordSegmenterClient:
 def compare_tokenization_fertility(
     sentences: List[str],
     qwen_tokenizer_id: str = "Qwen/Qwen2.5-1.5B-Instruct",
-    llama_tokenizer_id: str = "Xenova/llama3-tokenizer",
+    llama_tokenizer_id: str = "meta-llama/Llama-3.2-1B-Instruct",
     phobert_tokenizer_id: str = "vinai/phobert-base",
 ) -> Dict[str, Dict[str, float]]:
     """

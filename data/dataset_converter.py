@@ -66,11 +66,67 @@ def ws_tags_to_segmented_words(syllables: List[str], tags: List[str]) -> List[st
     return words
 
 
+# Universal Dependencies UPOS -> VietTreebank / VLSP short tags.
+UPOS_TO_VLSP = {
+    "NOUN": "N",
+    "PROPN": "Np",
+    "VERB": "V",
+    "AUX": "V",
+    "ADJ": "A",
+    "ADV": "R",
+    "PRON": "P",
+    "DET": "L",
+    "ADP": "E",
+    "NUM": "M",
+    "CCONJ": "C",
+    "SCONJ": "C",
+    "PART": "T",
+    "PUNCT": "CH",
+    "INTJ": "I",
+    "SYM": "X",
+    "X": "X",
+}
+
+
+def detach_edge_punctuation(token: str) -> List[str]:
+    """Split punctuation clinging to a word into its own tokens. 'hoa.' -> ['hoa', '.']."""
+    if not token:
+        return []
+    core = token
+    prefix = ""
+    suffix = ""
+    while core and not (core[0].isalnum() or core[0] == "_"):
+        prefix += core[0]
+        core = core[1:]
+    while core and not (core[-1].isalnum() or core[-1] == "_"):
+        suffix = core[-1] + suffix
+        core = core[:-1]
+    parts: List[str] = []
+    if prefix:
+        parts.append(prefix)
+    if core:
+        parts.append(core)
+    if suffix:
+        parts.append(suffix)
+    return parts or [token]
+
+
+def normalized_ws_syllables(text: str) -> List[str]:
+    """NFC syllable sequence with edge punctuation detached, for alignment checks."""
+    syllables: List[str] = []
+    for token in normalize_text(text).split():
+        for piece in detach_edge_punctuation(token):
+            for part in piece.split("_"):
+                if part:
+                    syllables.append(normalize_text(part))
+    return syllables
+
+
 def normalize_pos_tag(tag: str) -> str:
     """
-    Normalize POS tags across HumanSignal / Label Studio, Underthesea, PyVi, and VLSP.
-    Unifies punctuation tags ('CH', 'F', 'PU') to 'CH' and extracts short codes from
-    verbose Label Studio labels such as 'N (Danh từ / Noun)'.
+    Normalize POS tags across HumanSignal / Label Studio, Underthesea, PyVi, VLSP, and UPOS.
+    Unifies punctuation tags ('CH', 'F', 'PU') to 'CH', maps UPOS labels such as NOUN/VERB
+    onto the VLSP tagset, and extracts short codes from verbose Label Studio labels.
     """
     if not tag:
         return "N"
@@ -86,7 +142,14 @@ def normalize_pos_tag(tag: str) -> str:
         "CC": "C",
         "S": "E",
     }
-    return mapping.get(short, short)
+    if short in mapping:
+        return mapping[short]
+    upper = short.upper()
+    if upper in UPOS_TO_VLSP:
+        return UPOS_TO_VLSP[upper]
+    if short.isupper() and len(short) >= 3:
+        return "X"
+    return short
 
 
 def parse_pos_line(line: str) -> Optional[Tuple[List[str], List[str]]]:

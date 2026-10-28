@@ -8,6 +8,7 @@ from pipeline import (
     VietnameseNLPPipeline,
     load_config,
     run_full_evaluation,
+    train_dpo_model,
     train_hmm_models,
     train_phobert_models,
 )
@@ -89,6 +90,19 @@ def main():
     )
     p_train.add_argument("--epochs", type=int, default=None, help="Override PhoBERT epochs")
 
+    # 2b. train-dpo
+    p_dpo = sub.add_parser(
+        "train-dpo",
+        help="Align PhoBERT word segmentation with Direct Preference Optimization and refresh LLM memory",
+    )
+    p_dpo.add_argument("--epochs", type=int, default=None, help="Override DPO epochs")
+    p_dpo.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop after this many optimizer steps (useful for a one-batch smoke test)",
+    )
+
     # 3. evaluate
     p_eval = sub.add_parser(
         "evaluate",
@@ -130,10 +144,12 @@ def main():
         choices=[
             "hmm",
             "phobert",
+            "phobert_dpo",
             "hybrid",
             "cascade",
             "cascade_qwen",
             "cascade_llama",
+            "cascade_dpo",
             "qwen",
             "llama",
             "pyvi",
@@ -178,6 +194,10 @@ def main():
             saved_pb = train_phobert_models(config, tasks=tasks, epochs_override=args.epochs)
             print("Trained PhoBERT models:", saved_pb)
 
+    elif args.command == "train-dpo":
+        saved_dpo = train_dpo_model(config, epochs_override=args.epochs, max_steps=args.max_steps)
+        print("Trained PhoBERT-DPO:", {k: v for k, v in saved_dpo.items() if k != "history"})
+
     elif args.command == "evaluate":
         results = run_full_evaluation(config, include_phobert=not args.hmm_only)
         print_evaluation_table(results)
@@ -206,7 +226,9 @@ def main():
             fertility = compare_tokenization_fertility(
                 sentences=all_seg_sents,
                 qwen_tokenizer_id=models_cfg.get("qwen", {}).get("tokenizer_id", "Qwen/Qwen2.5-1.5B-Instruct"),
-                llama_tokenizer_id=models_cfg.get("llama", {}).get("tokenizer_id", "Xenova/llama3-tokenizer"),
+                llama_tokenizer_id=models_cfg.get("llama", {}).get(
+                    "tokenizer_id", "meta-llama/Llama-3.2-1B-Instruct"
+                ),
                 phobert_tokenizer_id=config.get("phobert", {}).get("model_name", "vinai/phobert-base"),
             )
             print("\n=== Vietnamese Tokenization Tax (Subword Fertility) ===")

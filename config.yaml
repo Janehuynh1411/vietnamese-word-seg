@@ -23,6 +23,7 @@ phobert:
   weight_decay: 0.01
   seed: 42
   ws_checkpoint: "models/phobert_ws"
+  ws_dpo_checkpoint: "models/phobert_ws_dpo"
   pos_checkpoint: "models/phobert_pos"
 
 # LLM config (Qwen vs. Llama Benchmarking & Asymmetric Routing)
@@ -41,7 +42,7 @@ llm:
       api_model: "groq/llama-3.1-70b-versatile"
       ollama_model: "ollama/llama3.1:8b"
       hf_model: "meta-llama/Llama-3.2-1B-Instruct"
-      tokenizer_id: "huggyllama/llama-7b"
+      tokenizer_id: "meta-llama/Llama-3.2-1B-Instruct"
 
   params:
     temperature: 0.0
@@ -52,6 +53,15 @@ llm:
   prompting:
     strategy: "few-shot" # zero-shot, few-shot, chain-of-thought
     context_window: 2
+
+# PhoBERT-DPO alignment
+dpo:
+  beta: 0.1
+  sft_anchor_weight: 0.1
+  epochs: 1
+  batch_size: 8
+  preferences: "data/processed/dpo_preferences.jsonl"
+  memory: "models/llm_dpo_memory.json"
 
 # Asymmetric confidence routing thresholds
 routing:

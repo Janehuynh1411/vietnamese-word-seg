@@ -1,4 +1,6 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from data.dataset_converter import normalized_ws_syllables
 
 
 DEFAULT_FEW_SHOT_EXAMPLES: List[Tuple[str, str, str]] = [
@@ -36,14 +38,36 @@ SYSTEM_PROMPT_POS = (
 )
 
 
+def _constraint_hint(
+    preferred_compounds: Optional[Iterable[str]] = None,
+    rejected_compounds: Optional[Iterable[str]] = None,
+    limit: int = 40,
+) -> str:
+    lines = []
+    preferred = sorted({item.strip() for item in (preferred_compounds or []) if item and str(item).strip()})
+    rejected = sorted({item.strip() for item in (rejected_compounds or []) if item and str(item).strip()})
+    if preferred:
+        shown = ", ".join(preferred[:limit])
+        lines.append(f"Prefer these compound joins: {shown}.")
+    if rejected:
+        shown = ", ".join(rejected[:limit])
+        lines.append(f"Do not join these rejected boundaries: {shown}.")
+    if not lines:
+        return ""
+    return "\n" + "\n".join(lines)
+
+
 def build_ws_messages(
     raw_sentence: str,
     strategy: str = "few-shot",
     examples: Optional[List[Tuple[str, str, str]]] = None,
     ambiguous_indices: Optional[List[int]] = None,
+    preferred_compounds: Optional[Iterable[str]] = None,
+    rejected_compounds: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, str]]:
     """
     Build chat messages for Vietnamese Word Segmentation using zero-shot, few-shot, or chain-of-thought.
+    Optional preference compounds from models/llm_dpo_memory.json are injected as constraints.
     """
     shots = examples if examples is not None else DEFAULT_FEW_SHOT_EXAMPLES
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_WS}]
@@ -59,6 +83,7 @@ def build_ws_messages(
         focus_tokens = [syllables[i] for i in ambiguous_indices if 0 <= i < len(syllables)]
         if focus_tokens:
             focus_hint = f"\nPay special attention to ambiguous boundaries around: {', '.join(focus_tokens)}."
+    focus_hint += _constraint_hint(preferred_compounds, rejected_compounds)
 
     if strategy == "chain-of-thought":
         user_prompt = (
@@ -106,6 +131,10 @@ def build_pos_messages(
 def parse_llm_ws_output(response_text: str, fallback_raw_sentence: str) -> str:
     """
     Extract the clean segmented sentence from LLM response text and verify syllable preservation.
+
+    Comparison is NFC-normalized and ignores punctuation that the model attached to a
+    neighboring syllable. A candidate that still does not match the original syllable
+    sequence is discarded in favor of the unsegmented sentence.
     """
     if not response_text or not response_text.strip():
         return fallback_raw_sentence.strip()
@@ -121,11 +150,10 @@ def parse_llm_ws_output(response_text: str, fallback_raw_sentence: str) -> str:
             break
 
     candidate = candidate.strip("`\"' ")
-    orig_syllables = fallback_raw_sentence.strip().split()
-    cand_syllables = [s for w in candidate.split() for s in w.split("_") if s]
+    orig_syllables = normalized_ws_syllables(fallback_raw_sentence)
+    cand_syllables = normalized_ws_syllables(candidate)
 
-    # Ensure the LLM did not hallucinate or drop syllables
-    if len(cand_syllables) != len(orig_syllables):
+    if cand_syllables != orig_syllables:
         return fallback_raw_sentence.strip()
 
     return candidate

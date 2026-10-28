@@ -1,6 +1,8 @@
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from data.dataset_converter import detach_edge_punctuation, normalize_pos_tag
+
 
 def segmented_sentence_to_spans(segmented_text: str) -> List[Tuple[int, int, str]]:
     """
@@ -8,7 +10,9 @@ def segmented_sentence_to_spans(segmented_text: str) -> List[Tuple[int, int, str
     [(start_syllable_idx, end_syllable_idx, word_str), ...]
     Example: "Tôi là sinh_viên" -> [(0, 1, "Tôi"), (1, 2, "là"), (2, 4, "sinh_viên")]
     """
-    words = segmented_text.strip().split()
+    words: List[str] = []
+    for token in segmented_text.strip().split():
+        words.extend(detach_edge_punctuation(token))
     spans: List[Tuple[int, int, str]] = []
     cursor = 0
     for word in words:
@@ -152,14 +156,14 @@ def evaluate_pos_tagging(
         gold_Typed_spans = set()
         for word, tag in gold_sent:
             length = max(1, len([s for s in word.split("_") if s]))
-            gold_Typed_spans.add((g_cursor, g_cursor + length, tag))
+            gold_Typed_spans.add((g_cursor, g_cursor + length, normalize_pos_tag(tag)))
             g_cursor += length
 
         p_cursor = 0
         pred_Typed_spans = set()
         for word, tag in pred_sent:
             length = max(1, len([s for s in word.split("_") if s]))
-            pred_Typed_spans.add((p_cursor, p_cursor + length, tag))
+            pred_Typed_spans.add((p_cursor, p_cursor + length, normalize_pos_tag(tag)))
             p_cursor += length
 
         joint_gold_total += len(gold_Typed_spans)
@@ -168,6 +172,8 @@ def evaluate_pos_tagging(
 
         # Token-level evaluation when lengths match (or up to aligned words)
         for (g_word, g_tag), (p_word, p_tag) in zip(gold_sent, pred_sent):
+            g_tag = normalize_pos_tag(g_tag)
+            p_tag = normalize_pos_tag(p_tag)
             token_total += 1
             is_oov = vocab_set is not None and g_word.lower() not in vocab_set
             if is_oov:
