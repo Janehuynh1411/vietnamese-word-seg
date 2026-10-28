@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
@@ -32,7 +33,16 @@ DEFAULT_CONFIG = {
         "weight_decay": 0.01,
         "seed": 42,
         "ws_checkpoint": "models/phobert_ws",
+        "ws_dpo_checkpoint": "models/phobert_ws_dpo",
         "pos_checkpoint": "models/phobert_pos",
+    },
+    "dpo": {
+        "beta": 0.1,
+        "sft_anchor_weight": 0.1,
+        "epochs": 1,
+        "batch_size": 8,
+        "preferences": "data/processed/dpo_preferences.jsonl",
+        "memory": "models/llm_dpo_memory.json",
     },
     "llm": {
         "primary_model": "groq/llama-3.1-70b-versatile",
@@ -70,7 +80,7 @@ def load_config(config_path: str = "config.yaml") -> dict:
 class VietnameseNLPPipeline:
     """
     Two-stage Vietnamese NLP Pipeline with Asymmetric Confidence-Based Routing:
-      Stage 1: Word Segmentation ('hmm', 'phobert', 'hybrid', 'cascade', 'cascade_qwen', 'cascade_llama', 'qwen', 'llama', 'pyvi', 'underthesea', 'llm')
+      Stage 1: Word Segmentation ('hmm', 'phobert', 'phobert_dpo', 'hybrid', 'cascade', 'cascade_qwen', 'cascade_llama', 'cascade_dpo', 'qwen', 'llama', 'pyvi', 'underthesea', 'llm')
       Stage 2: POS Tagging ('hmm', 'phobert', 'pyvi', 'underthesea', 'qwen', 'llama', 'llm')
     """
 
@@ -80,16 +90,21 @@ class VietnameseNLPPipeline:
         pos_mode: str = "phobert",
         config_path: str = "config.yaml",
         device: Optional[str] = None,
-        hmm_threshold: float = 0.85,
-        phobert_threshold: float = 0.70,
+        hmm_threshold: Optional[float] = None,
+        phobert_threshold: Optional[float] = None,
         llm_backend: str = "auto",
     ):
         self.config = load_config(config_path)
         self.ws_mode = ws_mode
         self.pos_mode = pos_mode
         self.device = device
-        self.hmm_threshold = hmm_threshold
-        self.phobert_threshold = phobert_threshold
+        routing_cfg = self.config.get("routing", {})
+        self.hmm_threshold = float(
+            routing_cfg.get("hmm_confidence_threshold", 0.85) if hmm_threshold is None else hmm_threshold
+        )
+        self.phobert_threshold = float(
+            routing_cfg.get("phobert_confidence_threshold", 0.70) if phobert_threshold is None else phobert_threshold
+        )
         self.llm_backend = llm_backend
 
         self.hmm_ws: Optional[ViterbiSegmenter] = None
@@ -103,6 +118,9 @@ class VietnameseNLPPipeline:
             "tier1_hmm_syllables": 0,
             "tier2_phobert_syllables": 0,
             "tier3_llm_syllables": 0,
+            "tier1_ms": 0.0,
+            "tier2_ms": 0.0,
+            "tier3_ms": 0.0,
             "sentences_processed": 0,
         }
 
@@ -118,24 +136,42 @@ class VietnameseNLPPipeline:
         pos_weights = hmm_cfg.get("pos_weights", "models/pos_hmm.json")
         phobert_base = phobert_cfg.get("model_name", "vinai/phobert-base")
         phobert_ws_ckpt = phobert_cfg.get("ws_checkpoint", "models/phobert_ws")
+        phobert_dpo_ckpt = phobert_cfg.get("ws_dpo_checkpoint", "models/phobert_ws_dpo")
         phobert_pos_ckpt = phobert_cfg.get("pos_checkpoint", "models/phobert_pos")
         max_len = int(phobert_cfg.get("max_length", 256))
 
-        if self.ws_mode in ("hmm", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        hmm_modes = ("hmm", "hybrid", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo")
+        phobert_modes = (
+            "phobert",
+            "phobert_dpo",
+            "hybrid",
+            "cascade",
+            "cascade_qwen",
+            "cascade_llama",
+            "cascade_dpo",
+        )
+        llm_modes = ("llm", "qwen", "llama", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo")
+        dpo_modes = ("phobert_dpo", "cascade_dpo")
+
+        if self.ws_mode in hmm_modes:
             if os.path.exists(ws_weights):
                 self.hmm_ws = ViterbiSegmenter(weights_path=ws_weights)
 
-        if self.ws_mode in ("phobert", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        if self.ws_mode in phobert_modes:
             from llm.phobert import PhoBERTWordSegmenter
 
-            ws_model_path = phobert_ws_ckpt if os.path.exists(phobert_ws_ckpt) else phobert_base
+            if self.ws_mode in dpo_modes and os.path.exists(phobert_dpo_ckpt):
+                ws_model_path = phobert_dpo_ckpt
+            elif os.path.exists(phobert_ws_ckpt):
+                ws_model_path = phobert_ws_ckpt
+            else:
+                ws_model_path = phobert_base
             self.phobert_ws = PhoBERTWordSegmenter(
                 model_name_or_path=ws_model_path,
                 max_length=max_len,
                 device=self.device,
             )
 
-        llm_modes = ("llm", "qwen", "llama", "cascade", "cascade_qwen", "cascade_llama")
         if self.ws_mode in llm_modes or self.pos_mode in ("llm", "qwen", "llama"):
             family = "qwen" if ("qwen" in self.ws_mode or "qwen" in self.pos_mode) else "llama"
             fam_cfg = models_cfg.get(family, {})
@@ -191,21 +227,32 @@ class VietnameseNLPPipeline:
                 pass
 
         if self.ws_mode in ("llm", "qwen", "llama") and self.llm_client is not None:
+            t0 = time.perf_counter()
+            segmented = self.llm_client.segment(text.strip())
+            self.routing_stats["tier3_ms"] += (time.perf_counter() - t0) * 1000.0
             self.routing_stats["tier3_llm_syllables"] += len(syllables)
-            return self.llm_client.segment(text.strip())
+            return segmented
 
         if self.ws_mode == "hmm" and self.hmm_ws is not None:
+            t0 = time.perf_counter()
+            segmented = self.hmm_ws.segment(text)
+            self.routing_stats["tier1_ms"] += (time.perf_counter() - t0) * 1000.0
             self.routing_stats["tier1_hmm_syllables"] += len(syllables)
-            return self.hmm_ws.segment(text)
+            return segmented
 
-        if self.ws_mode == "phobert" and self.phobert_ws is not None:
+        if self.ws_mode in ("phobert", "phobert_dpo") and self.phobert_ws is not None:
+            t0 = time.perf_counter()
+            segmented = self.phobert_ws.segment(text)
+            self.routing_stats["tier2_ms"] += (time.perf_counter() - t0) * 1000.0
             self.routing_stats["tier2_phobert_syllables"] += len(syllables)
-            return self.phobert_ws.segment(text)
+            return segmented
 
-        if self.ws_mode in ("hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        if self.ws_mode in ("hybrid", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo"):
             if self.hmm_ws is not None and self.phobert_ws is not None:
+                t0 = time.perf_counter()
                 _, hmm_tags, hmm_confs = self.hmm_ws.segment_with_confidence(text)
-                # Identify low-confidence or OOV syllable positions (plus their immediate neighbors)
+                self.routing_stats["tier1_ms"] += (time.perf_counter() - t0) * 1000.0
+                # Identify low-confidence syllable positions (plus their immediate neighbors)
                 uncertain_indices: Set[int] = set()
                 for idx, conf in enumerate(hmm_confs):
                     if conf < self.hmm_threshold:
@@ -219,13 +266,17 @@ class VietnameseNLPPipeline:
                     self.routing_stats["tier1_hmm_syllables"] += len(syllables)
                     return " ".join(ws_tags_to_segmented_words(syllables, hmm_tags))
 
+                t1 = time.perf_counter()
                 pb_tags, pb_confs = self.phobert_ws.predict_tags_with_confidence(syllables)
+                self.routing_stats["tier2_ms"] += (time.perf_counter() - t1) * 1000.0
                 llm_tags: Optional[List[str]] = None
 
                 # Tier 3 escalation in 'cascade*' mode when PhoBERT confidence is also below threshold
                 very_uncertain = [idx for idx in uncertain_indices if pb_confs[idx] < self.phobert_threshold]
                 if self.ws_mode.startswith("cascade") and very_uncertain and self.llm_client is not None:
+                    t2 = time.perf_counter()
                     llm_seg = self.llm_client.segment(text.strip(), ambiguous_indices=sorted(very_uncertain))
+                    self.routing_stats["tier3_ms"] += (time.perf_counter() - t2) * 1000.0
                     cand_tags = [
                         "B" if sub_i == 0 else "I"
                         for w in llm_seg.split()
@@ -409,6 +460,77 @@ def train_phobert_models(
         saved["phobert_pos"] = pos_ckpt
 
     return saved
+
+
+def train_dpo_model(
+    config: dict,
+    epochs_override: Optional[int] = None,
+    max_steps: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    Train PhoBERT with DPO on preference pairs and refresh the LLM constraint memory.
+
+    Preference data is built with data.dpo_builder when the jsonl file is missing.
+    The policy starts from models/phobert_ws when that checkpoint exists.
+    """
+    from data.dpo_builder import build_dpo_dataset
+    from llm.dpo_trainer import PhoBERTDPOTrainer, build_llm_preference_memory, load_preference_pairs
+
+    paths_cfg = config.get("paths", {})
+    phobert_cfg = config.get("phobert", {})
+    dpo_cfg = config.get("dpo", {})
+    hmm_cfg = config.get("hmm", {})
+    processed_dir = paths_cfg.get("processed_data", "data/processed")
+    prefs_path = dpo_cfg.get("preferences", os.path.join(processed_dir, "dpo_preferences.jsonl"))
+    ws_splits_path = paths_cfg.get("ws_splits", os.path.join(processed_dir, "ws_splits.json"))
+
+    if not os.path.exists(prefs_path):
+        if not os.path.exists(ws_splits_path):
+            prepare_dataset(
+                raw_dir=paths_cfg.get("raw_data", "data/raw"),
+                output_dir=processed_dir,
+            )
+        ws_ckpt = phobert_cfg.get("ws_checkpoint", "models/phobert_ws")
+        build_dpo_dataset(
+            ws_splits_path=ws_splits_path,
+            hmm_weights_path=hmm_cfg.get("ws_weights", "models/hmm_weights.json"),
+            phobert_ckpt_path=ws_ckpt if os.path.exists(ws_ckpt) else None,
+            output_dir=processed_dir,
+        )
+
+    pairs = load_preference_pairs(prefs_path)
+    if not pairs:
+        raise ValueError(f"No DPO preference pairs found at {prefs_path}")
+
+    sft_ckpt = phobert_cfg.get("ws_checkpoint", "models/phobert_ws")
+    base_checkpoint = sft_ckpt if os.path.exists(sft_ckpt) else phobert_cfg.get("model_name", "vinai/phobert-base")
+    save_dir = phobert_cfg.get("ws_dpo_checkpoint", "models/phobert_ws_dpo")
+    memory_path = dpo_cfg.get("memory", "models/llm_dpo_memory.json")
+    epochs = int(epochs_override if epochs_override is not None else dpo_cfg.get("epochs", 1))
+
+    trainer = PhoBERTDPOTrainer(
+        base_checkpoint=base_checkpoint,
+        beta=float(dpo_cfg.get("beta", 0.1)),
+        sft_anchor_weight=float(dpo_cfg.get("sft_anchor_weight", 0.1)),
+        max_length=int(phobert_cfg.get("max_length", 256)),
+    )
+    history = trainer.train(
+        train_pairs=pairs,
+        epochs=epochs,
+        batch_size=int(dpo_cfg.get("batch_size", phobert_cfg.get("batch_size", 8))),
+        learning_rate=float(dpo_cfg.get("learning_rate", phobert_cfg.get("learning_rate", 2e-5))),
+        save_dir=save_dir,
+        max_steps=max_steps,
+    )
+    memory = build_llm_preference_memory(pairs, memory_path)
+    return {
+        "phobert_ws_dpo": save_dir,
+        "llm_dpo_memory": memory_path,
+        "pairs": len(pairs),
+        "preferred_count": memory["preferred_count"],
+        "rejected_count": memory["rejected_count"],
+        "history": history,
+    }
 
 
 def _evaluate_single_pipeline(
