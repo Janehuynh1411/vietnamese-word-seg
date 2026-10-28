@@ -118,7 +118,23 @@ def main():
         help="Prompting strategy override",
     )
 
-    # 5. demo
+    # 5. build-dpo
+    p_bdpo = sub.add_parser(
+        "build-dpo",
+        help="Mine (prompt, chosen, rejected) HITL-DPO preference pairs and generate HumanSignal pairwise A/B tasks",
+    )
+    p_bdpo.add_argument("--hitl-export", default=None, help="Optional HumanSignal pairwise A/B export JSON")
+
+    # 6. train-dpo
+    p_tdpo = sub.add_parser(
+        "train-dpo",
+        help="Align PhoBERT and Qwen/Llama preference memory using Direct Preference Optimization (DPO)",
+    )
+    p_tdpo.add_argument("--epochs", type=int, default=4, help="Number of DPO training epochs")
+    p_tdpo.add_argument("--beta", type=float, default=0.5, help="DPO KL regularization beta")
+    p_tdpo.add_argument("--lr", type=float, default=1e-5, help="DPO learning rate")
+
+    # 7. demo
     p_demo = sub.add_parser("demo", help="Run the full WS + POS pipeline on sample text")
     p_demo.add_argument(
         "--text",
@@ -130,10 +146,12 @@ def main():
         choices=[
             "hmm",
             "phobert",
+            "phobert_dpo",
             "hybrid",
             "cascade",
             "cascade_qwen",
             "cascade_llama",
+            "cascade_dpo",
             "qwen",
             "llama",
             "pyvi",
@@ -220,6 +238,62 @@ def main():
                     )
                 else:
                     print(f"  {fam:<10} ({info['tokenizer_id']}): unavailable ({info.get('error', '')[:60]})")
+
+    elif args.command == "build-dpo":
+        from data.dpo_builder import build_dpo_dataset
+
+        summary = build_dpo_dataset(
+            ws_splits_path=paths_cfg.get("ws_splits", "data/processed/ws_splits.json"),
+            hmm_weights_path=config.get("hmm", {}).get("ws_weights", "models/hmm_weights.json"),
+            phobert_ckpt_path=config.get("phobert", {}).get("ws_checkpoint", "models/phobert_ws"),
+            hitl_pairwise_path=args.hitl_export,
+            output_dir=paths_cfg.get("processed_data", "data/processed"),
+        )
+        print(
+            f"Built HITL-DPO dataset: {summary['train_pairs']} train preference pairs, "
+            f"{summary['val_pairs']} val preference pairs"
+        )
+        print(f"  DPO JSONL:             {summary['dpo_jsonl']}")
+        print(f"  HumanSignal A/B tasks: {summary['label_studio_dpo_pairs']} ({summary['hitl_ab_tasks']} tasks)")
+        print(f"  HumanSignal XML UI:    {summary['label_studio_dpo_xml']}")
+
+    elif args.command == "train-dpo":
+        from data.dpo_builder import build_dpo_dataset
+        from llm.dpo_trainer import PhoBERTDPOTrainer, build_llm_preference_memory
+
+        dpo_json_path = os.path.join(paths_cfg.get("processed_data", "data/processed"), "dpo_preferences.json")
+        if not os.path.exists(dpo_json_path):
+            build_dpo_dataset(
+                ws_splits_path=paths_cfg.get("ws_splits", "data/processed/ws_splits.json"),
+                hmm_weights_path=config.get("hmm", {}).get("ws_weights", "models/hmm_weights.json"),
+                phobert_ckpt_path=config.get("phobert", {}).get("ws_checkpoint", "models/phobert_ws"),
+                output_dir=paths_cfg.get("processed_data", "data/processed"),
+            )
+
+        with open(dpo_json_path, "r", encoding="utf-8") as f:
+            dpo_splits = json.load(f)
+
+        print(f"Aligning PhoBERT with DPO on {len(dpo_splits['train'])} preference pairs (beta={args.beta})...")
+        trainer = PhoBERTDPOTrainer(
+            base_checkpoint=config.get("phobert", {}).get("ws_checkpoint", "models/phobert_ws"),
+            fallback_model=config.get("phobert", {}).get("model_name", "vinai/phobert-base"),
+            beta=args.beta,
+        )
+        save_dir = config.get("phobert", {}).get("ws_dpo_checkpoint", "models/phobert_ws_dpo")
+        trainer.train(
+            train_pairs=dpo_splits["train"],
+            val_pairs=dpo_splits.get("val"),
+            epochs=args.epochs,
+            learning_rate=args.lr,
+            save_dir=save_dir,
+        )
+        print(f"Saved DPO-aligned PhoBERT model to {save_dir}")
+
+        mem_info = build_llm_preference_memory(dpo_splits["train"])
+        print(
+            f"Saved LLM DPO preference memory to {mem_info['save_path']} "
+            f"(+{mem_info['preferred_count']} preferred compounds, -{mem_info['rejected_count']} rejected compounds)"
+        )
 
     elif args.command == "demo":
         pipe = VietnameseNLPPipeline(

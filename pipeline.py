@@ -118,26 +118,30 @@ class VietnameseNLPPipeline:
         pos_weights = hmm_cfg.get("pos_weights", "models/pos_hmm.json")
         phobert_base = phobert_cfg.get("model_name", "vinai/phobert-base")
         phobert_ws_ckpt = phobert_cfg.get("ws_checkpoint", "models/phobert_ws")
+        phobert_dpo_ckpt = phobert_cfg.get("ws_dpo_checkpoint", "models/phobert_ws_dpo")
         phobert_pos_ckpt = phobert_cfg.get("pos_checkpoint", "models/phobert_pos")
         max_len = int(phobert_cfg.get("max_length", 256))
 
-        if self.ws_mode in ("hmm", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        if self.ws_mode in ("hmm", "hybrid", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo"):
             if os.path.exists(ws_weights):
                 self.hmm_ws = ViterbiSegmenter(weights_path=ws_weights)
 
-        if self.ws_mode in ("phobert", "hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        if self.ws_mode in ("phobert", "phobert_dpo", "hybrid", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo"):
             from llm.phobert import PhoBERTWordSegmenter
 
-            ws_model_path = phobert_ws_ckpt if os.path.exists(phobert_ws_ckpt) else phobert_base
+            if self.ws_mode in ("phobert_dpo", "cascade_dpo") and os.path.exists(phobert_dpo_ckpt):
+                ws_model_path = phobert_dpo_ckpt
+            else:
+                ws_model_path = phobert_ws_ckpt if os.path.exists(phobert_ws_ckpt) else phobert_base
             self.phobert_ws = PhoBERTWordSegmenter(
                 model_name_or_path=ws_model_path,
                 max_length=max_len,
                 device=self.device,
             )
 
-        llm_modes = ("llm", "qwen", "llama", "cascade", "cascade_qwen", "cascade_llama")
+        llm_modes = ("llm", "qwen", "llama", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo")
         if self.ws_mode in llm_modes or self.pos_mode in ("llm", "qwen", "llama"):
-            family = "qwen" if ("qwen" in self.ws_mode or "qwen" in self.pos_mode) else "llama"
+            family = "llama" if ("llama" in self.ws_mode or "llama" in self.pos_mode) else "qwen"
             fam_cfg = models_cfg.get(family, {})
             self.llm_client = LLMWordSegmenterClient(
                 model_family=family,
@@ -198,11 +202,11 @@ class VietnameseNLPPipeline:
             self.routing_stats["tier1_hmm_syllables"] += len(syllables)
             return self.hmm_ws.segment(text)
 
-        if self.ws_mode == "phobert" and self.phobert_ws is not None:
+        if self.ws_mode in ("phobert", "phobert_dpo") and self.phobert_ws is not None:
             self.routing_stats["tier2_phobert_syllables"] += len(syllables)
             return self.phobert_ws.segment(text)
 
-        if self.ws_mode in ("hybrid", "cascade", "cascade_qwen", "cascade_llama"):
+        if self.ws_mode in ("hybrid", "cascade", "cascade_qwen", "cascade_llama", "cascade_dpo"):
             if self.hmm_ws is not None and self.phobert_ws is not None:
                 _, hmm_tags, hmm_confs = self.hmm_ws.segment_with_confidence(text)
                 # Identify low-confidence or OOV syllable positions (plus their immediate neighbors)
@@ -605,6 +609,38 @@ def run_full_evaluation(
                 train_vocab,
             )
         )
+
+        # 8. HITL-DPO Aligned PhoBERT & 3-Tier Cascade (if DPO checkpoint exists)
+        dpo_ckpt = config.get("phobert", {}).get("ws_dpo_checkpoint", "models/phobert_ws_dpo")
+        if os.path.exists(dpo_ckpt):
+            phobert_dpo_pipe = VietnameseNLPPipeline(ws_mode="phobert_dpo", pos_mode="phobert")
+            results.append(
+                _evaluate_single_pipeline(
+                    "phobert_dpo",
+                    phobert_dpo_pipe,
+                    raw_test_sentences,
+                    gold_ws_sentences,
+                    gold_pos_sentences,
+                    train_vocab,
+                )
+            )
+
+            cascade_dpo_pipe = VietnameseNLPPipeline(
+                ws_mode="cascade_dpo",
+                pos_mode="phobert",
+                hmm_threshold=0.95,
+                phobert_threshold=0.60,
+            )
+            results.append(
+                _evaluate_single_pipeline(
+                    "cascade_3tier_dpo",
+                    cascade_dpo_pipe,
+                    raw_test_sentences,
+                    gold_ws_sentences,
+                    gold_pos_sentences,
+                    train_vocab,
+                )
+            )
 
     log_path = paths_cfg.get("logs", "logs/experiment_results.csv")
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)

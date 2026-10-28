@@ -23,6 +23,7 @@ phobert:
   weight_decay: 0.01
   seed: 42
   ws_checkpoint: "models/phobert_ws"
+  ws_dpo_checkpoint: "models/phobert_ws_dpo"
   pos_checkpoint: "models/phobert_pos"
 
 # LLM config (Qwen vs. Llama Benchmarking & Asymmetric Routing)

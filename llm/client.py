@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -67,6 +68,8 @@ class LLMWordSegmenterClient:
         self.dictionary_path = dictionary_path
         self.device = device
         self.vocab: Set[str] = self._load_dictionary(dictionary_path)
+        self.preferred_compounds, self.rejected_compounds = self._load_dpo_memory("models/llm_dpo_memory.json")
+        self.vocab = (self.vocab | self.preferred_compounds) - self.rejected_compounds
 
         self._hf_tokenizer = None
         self._hf_model = None
@@ -91,6 +94,17 @@ class LLMWordSegmenterClient:
                     if w:
                         vocab.add(w)
         return vocab
+
+    @staticmethod
+    def _load_dpo_memory(path: str) -> Tuple[Set[str], Set[str]]:
+        if not os.path.exists(path):
+            return set(), set()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data.get("preferred_compounds", [])), set(data.get("rejected_compounds", []))
+        except Exception:
+            return set(), set()
 
     def _has_api_keys(self) -> bool:
         return bool(
@@ -233,7 +247,7 @@ class LLMWordSegmenterClient:
                     i += matched_len
                 else:
                     i += 1
-            return tags
+            return self._apply_dpo_rejected_filter(syllables, tags)
 
         else:
             # Llama offline profile: PyVi CRF + domain dictionary longest-match
@@ -268,7 +282,22 @@ class LLMWordSegmenterClient:
                     i += matched_len
                 else:
                     i += 1
+            return self._apply_dpo_rejected_filter(syllables, tags)
+
+    def _apply_dpo_rejected_filter(self, syllables: List[str], tags: List[str]) -> List[str]:
+        """Split any compound word that was explicitly rejected in HITL-DPO preference pairs."""
+        if not self.rejected_compounds or not syllables:
             return tags
+        words = ws_tags_to_segmented_words(syllables, tags)
+        filtered_tags: List[str] = []
+        for w in words:
+            parts = [p for p in w.split("_") if p]
+            if w.lower() in self.rejected_compounds and len(parts) > 1:
+                filtered_tags.extend(["B"] * len(parts))
+            else:
+                for idx in range(len(parts)):
+                    filtered_tags.append("B" if idx == 0 else "I")
+        return filtered_tags if len(filtered_tags) == len(syllables) else tags
 
     def segment(
         self,

@@ -155,6 +155,46 @@ class TestVietnameseWordSegPipeline(unittest.TestCase):
             self.assertEqual(len(confs), 5)
             self.assertTrue(all(0.0 <= c <= 1.0 for c in confs))
 
+    def test_dpo_loss_and_preference_memory(self):
+        import tempfile
+        import torch
+        from llm.dpo_trainer import (
+            build_llm_preference_memory,
+            compute_dpo_loss,
+            sequence_log_probs_from_logits,
+        )
+
+        # Policy strongly prefers chosen over rejected compared to reference
+        policy_chosen = torch.tensor([-0.2, -0.3])
+        policy_rejected = torch.tensor([-1.5, -1.2])
+        ref_chosen = torch.tensor([-0.6, -0.6])
+        ref_rejected = torch.tensor([-0.6, -0.6])
+
+        loss, margin, acc = compute_dpo_loss(
+            policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.5
+        )
+        self.assertGreater(float(margin.item()), 0.0)
+        self.assertAlmostEqual(float(acc.item()), 1.0, places=4)
+        self.assertLess(float(loss.item()), 0.6931)
+
+        logits = torch.tensor([[[2.0, -1.0], [-1.0, 2.0], [0.0, 0.0]]])
+        labels = torch.tensor([[0, 1, -100]])
+        seq_logp = sequence_log_probs_from_logits(logits, labels)
+        self.assertEqual(seq_logp.shape, (1,))
+        self.assertGreater(float(seq_logp[0].item()), -0.2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mem_path = os.path.join(tmpdir, "dpo_mem.json")
+            pairs = [
+                {
+                    "chosen": "Ẩm_thực làm thăng_hoa tình_yêu .",
+                    "rejected": "Ẩm_thực làm_thăng_hoa tình yêu .",
+                }
+            ]
+            info = build_llm_preference_memory(pairs, save_path=mem_path)
+            self.assertGreaterEqual(info["preferred_count"], 2)
+            self.assertGreaterEqual(info["rejected_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
